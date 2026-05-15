@@ -449,7 +449,16 @@ func needsReAttach(err error, alias string) bool {
 	if strings.Contains(msg, alias) && strings.Contains(msg, "does not exist") {
 		return true
 	}
-	// Quack HTTP-side failures the duckdb-go driver surfaces as plain errors.
+	// duckdb-go-bindings surfaces "Invalid Input Error: Invalid connection
+	// id" when the underlying TCP conn to the Quack server has gone bad
+	// (server restart, network drop). It's the most common signal we see
+	// in practice after a Quack server restart, before the *sql.DB pool
+	// has marked the conn bad.
+	if strings.Contains(msg, "Invalid connection id") {
+		return true
+	}
+	// Other Quack HTTP-side failures the duckdb-go driver surfaces as
+	// plain errors.
 	for _, sig := range []string{
 		"Failed to send message",
 		"Failed to receive message",

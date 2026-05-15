@@ -801,14 +801,20 @@ steps:
     args:
       - -c
       - |
-        PATTERN="duckdbquack|duckdb/duckdbsql|internal/server/|.ci/"
+        PATTERN="duckdbquack|duckdb/duckdb|internal/server/|.ci/"
 
         if grep -qE "$$PATTERN" /workspace/changed_files.txt; then
           echo "Changes detected. Running DuckDB Quack tests..."
           .ci/test_with_coverage.sh \
             "DuckDB Quack" \
             duckdbquack \
-            duckdb/duckdbsql
+            duckdb/duckdbsql \
+            duckdb/duckdbmeta \
+            duckdb/duckdblistcatalogs \
+            duckdb/duckdblistschemas \
+            duckdb/duckdblisttables \
+            duckdb/duckdbdescribetable \
+            duckdb/duckdbsummarizetable
         else
           echo "No relevant changes for DuckDB Quack. Skipping shard."
           exit 0

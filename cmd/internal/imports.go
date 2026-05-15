@@ -281,6 +281,7 @@ import (
 	_ "github.com/googleapis/mcp-toolbox/internal/sources/dataplex"
 	_ "github.com/googleapis/mcp-toolbox/internal/sources/dataproc"
 	_ "github.com/googleapis/mcp-toolbox/internal/sources/dgraph"
+	_ "github.com/googleapis/mcp-toolbox/internal/sources/duckdbquack"
 	_ "github.com/googleapis/mcp-toolbox/internal/sources/elasticsearch"
 	_ "github.com/googleapis/mcp-toolbox/internal/sources/firebird"
 	_ "github.com/googleapis/mcp-toolbox/internal/sources/firestore"

@@ -24,7 +24,6 @@ package duckdbquack
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -385,7 +384,7 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opt
 		}
 		row := orderedmap.Row{}
 		for i, name := range cols {
-			row.Add(name, normalizeValue(rawValues[i]))
+			row.Add(name, renderValue(rawValues[i], columns[i].Type))
 		}
 		out = append(out, row)
 	}
@@ -395,20 +394,32 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opt
 	return &QueryResult{Columns: columns, Rows: out, Truncated: truncated}, nil
 }
 
-// normalizeValue performs minimal value normalization for the Day 1 baseline.
-// Day 2 will replace this with a column-type-aware serializer per spec §7
-// (DECIMAL → string, BLOB rejected, LIST/STRUCT → nested JSON, etc.).
-func normalizeValue(v any) any {
+// renderValue applies the per-column-type rules from spec §7 to one cell.
+// The duckdb-go driver already decodes LIST/STRUCT/MAP into native Go
+// []any and map[string]any values that encoding/json handles correctly, so
+// only the precision-sensitive (DECIMAL) and rejected-by-default (BLOB)
+// types need explicit handling here.
+func renderValue(v any, dbType string) any {
 	if v == nil {
 		return nil
 	}
-	if s, ok := v.(string); ok {
-		var parsed any
-		if json.Unmarshal([]byte(s), &parsed) == nil {
-			switch parsed.(type) {
-			case map[string]any, []any:
-				return parsed
-			}
+	// DECIMAL(p,s): render as string to preserve precision. The duckdb-go
+	// driver decodes DECIMAL into a value whose String() method returns the
+	// canonical decimal representation (e.g. "12345.67"). Guard on the
+	// column type so we don't accidentally stringify other Stringer types
+	// such as time.Time, which JSON marshals correctly on its own.
+	if strings.HasPrefix(dbType, "DECIMAL") {
+		if s, ok := v.(fmt.Stringer); ok {
+			return s.String()
+		}
+	}
+	// BLOB: rejected by default. Replace the value with a sentinel that
+	// preserves the row layout but signals the rejection and the byte
+	// count. A future opt-in (e.g., result.allow_blob: true) can return
+	// the raw []byte (which encoding/json renders as base64).
+	if dbType == "BLOB" {
+		if b, ok := v.([]byte); ok {
+			return fmt.Sprintf("<blob: %d bytes>", len(b))
 		}
 	}
 	return v

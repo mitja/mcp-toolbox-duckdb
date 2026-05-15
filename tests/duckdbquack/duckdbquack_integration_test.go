@@ -25,6 +25,7 @@ package duckdbquack
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net"
 	"strconv"
@@ -323,6 +324,86 @@ func enableReadOnlyAuthz(t *testing.T, srv *quackServer) {
 		_, _ = srv.db.ExecContext(context.Background(),
 			"RESET GLOBAL quack_authorization_function")
 	})
+}
+
+// TestDecimalRenderedAsString proves that DECIMAL cell values come back as
+// strings in the QueryResult (spec §7 type rules: preserve precision).
+func TestDecimalRenderedAsString(t *testing.T) {
+	srv := startInProcessQuackServer(t)
+	src := newSource(t, srv, duckdbquack.Policy{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res, err := src.RunSQL(ctx,
+		"SELECT customer, SUM(amount) AS revenue FROM remote.sales WHERE customer = ? GROUP BY customer",
+		[]any{"Alice GmbH"}, duckdbquack.QueryOptions{})
+	if err != nil {
+		t.Fatalf("RunSQL: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(res.Rows))
+	}
+	revenue := lookupRowField(t, res.Rows[0], "revenue")
+	s, ok := revenue.(string)
+	if !ok {
+		t.Fatalf("revenue rendered as %T (%v), want string", revenue, revenue)
+	}
+	// Sum of (1000.00 + 250.50 + 120.00) = 1370.50. The duckdb-go Decimal
+	// type's String() strips trailing zeros, so the rendered string is
+	// "1370.5" — the value is preserved, the cosmetic scale is not.
+	// (A future polish could re-format to the column's declared scale.)
+	if s != "1370.5" {
+		t.Fatalf("revenue value: got %q, want %q", s, "1370.5")
+	}
+}
+
+// TestBlobRenderedAsSentinel proves that BLOB columns are not exposed
+// verbatim to callers; they are replaced by a "<blob: N bytes>" sentinel.
+func TestBlobRenderedAsSentinel(t *testing.T) {
+	srv := startInProcessQuackServer(t)
+	src := newSource(t, srv, duckdbquack.Policy{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res, err := src.RunSQL(ctx, "SELECT 'hello'::BLOB AS payload", nil, duckdbquack.QueryOptions{})
+	if err != nil {
+		t.Fatalf("RunSQL: %v", err)
+	}
+	if len(res.Columns) != 1 || res.Columns[0].Type != "BLOB" {
+		t.Fatalf("expected one BLOB column, got %+v", res.Columns)
+	}
+	payload := lookupRowField(t, res.Rows[0], "payload")
+	s, ok := payload.(string)
+	if !ok {
+		t.Fatalf("payload rendered as %T (%v), want sentinel string", payload, payload)
+	}
+	want := "<blob: 5 bytes>"
+	if s != want {
+		t.Fatalf("blob sentinel: got %q, want %q", s, want)
+	}
+}
+
+// lookupRowField extracts a named field from an orderedmap.Row. orderedmap
+// keeps insertion order so the field is found by a linear walk over the
+// JSON-marshaled form. We unmarshal the marshaled output to keep this test
+// independent of internal-tree orderedmap APIs.
+func lookupRowField(t *testing.T, row any, field string) any {
+	t.Helper()
+	b, err := json.Marshal(row)
+	if err != nil {
+		t.Fatalf("marshal row: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal row: %v", err)
+	}
+	v, ok := m[field]
+	if !ok {
+		t.Fatalf("field %q not present in row: %+v", field, m)
+	}
+	return v
 }
 
 // TestServerSideAuthz_RejectsInsert proves that the read-only authorization

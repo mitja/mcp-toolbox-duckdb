@@ -154,7 +154,9 @@ func (t Tool) Invoke(ctx context.Context, mgr tools.SourceProvider, params param
 		allowed = duckdbsql.DefaultAllowedStatementKinds
 	}
 	if err := duckdbsql.ValidateStatement(sql, allowed, policy.ForbiddenPatterns); err != nil {
-		return nil, util.NewAgentError(fmt.Sprintf("statement rejected by policy: %v", err), err)
+		// Pass nil as the Cause so AgentError.Error() does not append the
+		// underlying err's message again — it's already formatted into Msg.
+		return nil, util.NewAgentError(fmt.Sprintf("statement rejected by policy: %v", err), nil)
 	}
 
 	hash := duckdbmeta.StatementHash(sql)

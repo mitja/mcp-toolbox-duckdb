@@ -6,7 +6,51 @@ Spec: `.spec/mcp-toolbox-quack-duckdb.md` (local-only).
 
 ---
 
-# Phase 1 Summary (status: **complete**, 2026-05-15)
+# Phases 1–5 Summary (status: **complete in fork-scope**, 2026-05-15)
+
+All five phases have landed on `feat/duckdb-quack`. The work below is organized as a retrospective of what shipped per phase plus what is explicitly deferred. The forward-looking plan further down remains as the working specification used during the day-by-day work; this top section is the index.
+
+| Phase | Status | Highlight |
+|---|---|---|
+| 1 — MVP (source + duckdb-sql tool + demo) | ✅ | `duckdb-quack` source, `duckdb-sql` tool, in-process Quack integration tests, full Compose demo |
+| 2 — Metadata tools | ✅ | Five tools: list-catalogs / list-schemas / list-tables / describe-table / summarize-table, plus the shared `duckdbmeta` package |
+| 3 — Policy hardening + dev tool | ✅ | `Policy.ForbiddenPatterns`, `duckdb-execute-sql` with explicit-enable gate, cross-layer security test suite |
+| 4 — OpenTelemetry | ✅ | Source-level `duckdb.query` span (+ reattach event) + five metrics; demo wires OTel-Collector → Jaeger; agent + trace-client emit OTel too |
+| 5 — Release readiness (fork-scope) | ✅ | `golangci-lint run ./...` clean; deferred items are documented (no upstream PR scope) |
+
+### What's in the fork
+
+- **Source**: `internal/sources/duckdbquack/` — Quack-attached DuckDB client with `RunSQL` + `QuackQuery`, reconnect/re-attach on lost catalog, OTel span + 5 metrics, DECIMAL-scale-preserving result serializer, configurable Policy.
+- **Tools**:
+  - `internal/tools/duckdb/duckdbmeta/` — shared `CompatibleSource`, `Response`, `StatementHash`, `Invoke`, identifier validators.
+  - `duckdbsql` — agent-supplies-values curated SQL.
+  - `duckdbexecutesql` — dev-only, agent-supplied SQL, explicit-enable gate.
+  - `duckdblistcatalogs`, `duckdblistschemas`, `duckdblisttables`, `duckdbdescribetable`, `duckdbsummarizetable` — metadata tools.
+- **Tests**: 100+ test cases across `internal/sources/duckdbquack/`, `internal/tools/duckdb/`, and `tests/duckdbquack/`. Integration tests use an in-process Quack server (second `sql.Open("duckdb", "")` in the test process) — no Docker dependency.
+- **Docs**: `docs/en/integrations/duckdb-quack/source.md` and six tool pages (`tools/duckdb-*.md`), all passing `.ci/lint-docs-source-page.sh` / `.ci/lint-docs-tool-page.sh`.
+- **CI**: `.ci/integration.cloudbuild.yaml` shard scoped to `duckdbquack` + every `duckdb/duckdb*` tool package.
+- **Demo**: separate repo at [`mcp-toolbox-duckdb-demo`](https://github.com/mitja/mcp-toolbox-duckdb-demo) — Compose stack with Quack server, Toolbox, OTel-Collector, Jaeger, a LangGraph agent, and an OTel-instrumented trace-client.
+
+### How to consume the fork
+
+The fork keeps the upstream module path (`github.com/googleapis/mcp-toolbox`) so nothing else changes:
+
+```bash
+git clone https://github.com/mitja/mcp-toolbox-duckdb.git
+cd mcp-toolbox-duckdb
+git checkout feat/duckdb-quack
+go build -o toolbox .
+
+# or run via the demo's Compose stack
+cd ../mcp-toolbox-duckdb-demo
+docker compose up -d quack-server toolbox otel-collector jaeger
+```
+
+The fork is intentionally **not** rebased onto a new module path, so an upstream PR would be a trivial rebase if you ever decide to send one. Until then the four paste-ready upstream issue writeups in [`mcp-toolbox-duckdb-demo/NOTES.md`](https://github.com/mitja/mcp-toolbox-duckdb-demo/blob/main/NOTES.md) capture the bugs and design quirks worth contributing back independently of the fork itself.
+
+---
+
+# Phase 1 Summary
 
 End-to-end Phase 1 landed in two repositories. The forward-looking plan below remains as the working specification for the day-by-day work; this section captures what actually shipped and what we learned.
 
@@ -100,7 +144,7 @@ End-to-end JSON response verified through the full Compose stack:
 - **✅ Phase 2** (complete) — metadata tools landed: `duckdb-list-catalogs`, `duckdb-list-schemas`, `duckdb-list-tables`, `duckdb-describe-table`, `duckdb-summarize-table`. All share a new `internal/tools/duckdb/duckdbmeta` package (CompatibleSource interface, Response struct, Invoke helper, identifier validation, StatementHash). `duckdb-list-catalogs` runs client-side (against the in-process DuckDB's information_schema, which sees ATTACHed catalogs); the other four push their statements through a new `Source.QuackQuery()` method that uses Quack's `quack_query()` table function to run SQL directly on the remote (information_schema, DESCRIBE, SUMMARIZE all return empty / fail through the ATTACHed catalog view — `quack_query()` works because the remote evaluates the SQL natively). `duckdbsql` refactored to use `duckdbmeta` too — single source of truth for the response shape, hashing, and the source contract. Scope is fixed at tool-config time (no agent-supplied catalog/schema/table); identifiers are validated as ASCII safe at config-load and quote-escaped before interpolation. Tests: per-tool YAML parse (5) + a 5-subtest integration roundtrip + a contract test that QuackQuery surfaces remote parser errors verbatim. Docs: 5 new pages under `docs/en/integrations/duckdb-quack/tools/`, all pass the upstream tool-page linter. CI: shard updated to compile coverage for all six tool packages plus `duckdbmeta`. **Not implemented:** `duckdb-quack-whoami` (deferred — depends on Quack's identity-function semantics still being in beta flux; revisit when there's a concrete agent use case).
 - **✅ Phase 3** (complete, in part) — `forbidden_patterns` on `duckdbquack.Policy` (extends the validator's built-in deny list with operator-supplied tokens) and the `duckdb-execute-sql` dev tool. The tool is gated behind a per-entry `enabled: true` YAML field — missing or `false` aborts server start; `true` logs a WARN-level startup line every boot. The agent supplies one `sql` parameter that goes through the same statement validator duckdb-sql uses at config-load, applied per-invocation. **Not landed:** `allowed_catalogs`/`schemas`/`tables` (needs a SQL-parser design pass to scope correctly; defer until concrete need) and server-side authz hardening (Quack-side, not Toolbox-side — see `mcp-toolbox-duckdb-demo/NOTES.md` for the upstream issue writeup). 53 new test cases including a cross-layer security suite in `tests/duckdbquack/duckdbquack_security_test.go` that hits 15 destructive statements through `Tool.Invoke` and confirms ForbiddenPatterns / AllowedStatementKinds propagate from source policy to the dev tool's per-invocation check.
 - **✅ Phase 4** (complete, in part) — OpenTelemetry instrumentation at the source layer: every `Source.RunSQL` invocation is wrapped in a `duckdb.query` span (`db.system`, `toolbox.source.name`, `db.statement.parameter_count`, `db.response.rows`, `db.response.truncated`, `error.type`; plus a `reattach` span event when the recovery path fires) and emits five metrics (`duckdb.query.duration` histogram in seconds, `duckdb.query.rows_returned` histogram, `duckdb.query.errors_total` counter labeled by `error.type`, `duckdb.query.truncated_total` counter, `duckdb.connection.reattach_total` counter). Tested via `tracetest.SpanRecorder` — three tests pin the attribute set on the happy path, the error path (status=Error + `error.type` attribute), and the reattach path (presence of the `reattach` event). Raw SQL text is never attached to spans or logged — only its shape (parameter count) and outcome. Source docs updated with the full span/metric reference table. **Not landed:** `duckdb_quack_auth_failures_total` (would need pattern-matching auth-specific error strings) and `duckdb_result_bytes` (would need byte-counting through the response shaper); these are nice-to-haves with low marginal value over the five core metrics.
-- **Phase 5** — shared `tests/tool.go` suite integration, golangci-lint clean, compatibility test matrix across DuckDB stable + Quack nightly, **file an issue on `googleapis/mcp-toolbox` and open the upstream PR.**
+- **✅ Phase 5** (complete in fork-scope) — `golangci-lint run ./...` is clean across the whole module (with the project's `.golangci.yaml`: errcheck, govet, ineffassign, staticcheck, unused, goimports). All four lint hits the new packages had at landing were auto-fixed: three `goimports` alignment nits in struct tags / method signatures / a wrapped comment, and one `staticcheck` `QF1008` suggesting `s.Policy` over `s.Config.Policy` on an embedded field. One side note: the gofumpt-flavored "smart quotes" rewrite (part of `goimports` in golangci-lint v2) converts doubled ASCII single quotes in comments to typographic quotes — reworded a SQL-syntax doc comment to avoid the literal `''` pair so the technical meaning survives. **Deferred from upstream-PR readiness, per the no-upstream-PR scope:** (1) shared `tests/tool.go` suite integration (`RunToolGetTest`, `RunToolInvokeTest`, `RunMCPToolCallMethod`), which needs tools whose schemas match the upstream test fixtures plus seeded tables on the remote — substantial work that only pays off when an upstream PR is being prepared; (2) DuckDB-stable + Quack-nightly compatibility test matrix, which needs `go.mod` manipulation and matrix CI definitions and has no concrete forcing function in the fork; (3) the upstream issue and PR themselves. The fork's own integration tests, the security suite, the OTel tracing tests, and the demo's end-to-end checks remain authoritative.
 
 **Dropped from the original plan: embedded `duckdb` source + `DuckDBRunner` interface refactor.** Remote Quack is the architectural bet that distinguishes this project — lifecycle separation between Toolbox and the analytical runtime — and embedded DuckDB is already trivially achievable via the DuckDB CLI, duckdb-python, or running Quack on the same host and `ATTACH`ing locally. Adding a separate embedded source would dilute the focus and double the maintenance surface without a concrete user need. The `DuckDBRunner` refactor is YAGNI without a second implementation; the current duck-typed `compatibleSource` interface in `duckdbsql` provides the same polymorphism, and moving types into a shared package is a 15-minute mechanical refactor whenever it becomes useful. None of the remaining phases (2–5) depend on either. Reopen the discussion if a concrete user need for embedded DuckDB surfaces later.
 

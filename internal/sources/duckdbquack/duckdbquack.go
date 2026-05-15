@@ -56,6 +56,11 @@ const (
 // quote-injection regardless of where the token came from (env var, file).
 var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_\-]{8,}$`)
 
+// decimalTypePattern matches a DuckDB type-name string like "DECIMAL(18,2)"
+// and captures the scale group. Used as a fallback when the driver does not
+// implement sql.ColumnType.DecimalSize().
+var decimalTypePattern = regexp.MustCompile(`^DECIMAL\(\s*\d+\s*,\s*(\d+)\s*\)$`)
+
 // validate interface
 var _ sources.SourceConfig = Config{}
 
@@ -392,8 +397,20 @@ func (s *Source) executeQuery(ctx context.Context, q quackQuerier, statement str
 		return nil, fmt.Errorf("unable to get column types: %w", err)
 	}
 	columns := make([]Column, len(cols))
+	// scales holds the declared scale (`s`) of each DECIMAL(p,s) column for
+	// use by renderValue; 0 (and unused) for non-DECIMAL columns.
+	scales := make([]int64, len(cols))
 	for i, name := range cols {
-		columns[i] = Column{Name: name, Type: colTypes[i].DatabaseTypeName()}
+		dbType := colTypes[i].DatabaseTypeName()
+		columns[i] = Column{Name: name, Type: dbType}
+		if _, scale, ok := colTypes[i].DecimalSize(); ok {
+			scales[i] = scale
+		} else if s, ok := decimalScaleFromType(dbType); ok {
+			// duckdb-go-bindings does not implement DecimalSize() on its
+			// ColumnType, so parse the scale out of the type-name string
+			// (e.g., "DECIMAL(18,2)").
+			scales[i] = s
+		}
 	}
 
 	rawValues := make([]any, len(cols))
@@ -417,7 +434,7 @@ func (s *Source) executeQuery(ctx context.Context, q quackQuerier, statement str
 		}
 		row := orderedmap.Row{}
 		for i, name := range cols {
-			row.Add(name, renderValue(rawValues[i], columns[i].Type))
+			row.Add(name, renderValue(rawValues[i], columns[i].Type, scales[i]))
 		}
 		out = append(out, row)
 	}
@@ -514,19 +531,22 @@ func (s *Source) reAttachOnConn(ctx context.Context, conn *sql.Conn) error {
 // The duckdb-go driver already decodes LIST/STRUCT/MAP into native Go
 // []any and map[string]any values that encoding/json handles correctly, so
 // only the precision-sensitive (DECIMAL) and rejected-by-default (BLOB)
-// types need explicit handling here.
-func renderValue(v any, dbType string) any {
+// types need explicit handling here. The scale parameter is the declared
+// scale of a DECIMAL(p,s) column (0 and unused for other types).
+func renderValue(v any, dbType string, scale int64) any {
 	if v == nil {
 		return nil
 	}
 	// DECIMAL(p,s): render as string to preserve precision. The duckdb-go
 	// driver decodes DECIMAL into a value whose String() method returns the
-	// canonical decimal representation (e.g. "12345.67"). Guard on the
-	// column type so we don't accidentally stringify other Stringer types
-	// such as time.Time, which JSON marshals correctly on its own.
+	// canonical decimal representation but strips trailing zeros — so a
+	// DECIMAL(18,2) value of 1370.50 comes back as "1370.5". Pad to the
+	// column's declared scale so the response shows the full scale. Guard
+	// on the column type so we don't accidentally stringify other Stringer
+	// types such as time.Time, which JSON marshals correctly on its own.
 	if strings.HasPrefix(dbType, "DECIMAL") {
 		if s, ok := v.(fmt.Stringer); ok {
-			return s.String()
+			return formatDecimal(s.String(), scale)
 		}
 	}
 	// BLOB: rejected by default. Replace the value with a sentinel that
@@ -539,6 +559,46 @@ func renderValue(v any, dbType string) any {
 		}
 	}
 	return v
+}
+
+// decimalScaleFromType extracts the scale from a DuckDB DECIMAL type-name
+// string like "DECIMAL(18,2)". Returns ok=false for any other type. This is
+// a fallback for drivers (notably duckdb-go-bindings) that don't implement
+// sql.ColumnType.DecimalSize().
+func decimalScaleFromType(dbType string) (int64, bool) {
+	m := decimalTypePattern.FindStringSubmatch(dbType)
+	if m == nil {
+		return 0, false
+	}
+	var scale int64
+	for _, c := range m[1] {
+		scale = scale*10 + int64(c-'0')
+	}
+	return scale, true
+}
+
+// formatDecimal pads the trimmed string form of a DECIMAL value with
+// trailing zeros so it shows the column's declared scale. duckdb-go's
+// Decimal.String() drops trailing zeros (1370.50 -> "1370.5", 1000.00 ->
+// "1000"); this restores them so the JSON response matches the column's
+// declared shape.
+//
+// Inputs are expected to be the output of duckdb-go's Decimal.String(): a
+// signed decimal literal, optionally with a single '.' separator, never in
+// scientific notation. scale<=0 returns the value unchanged.
+func formatDecimal(s string, scale int64) string {
+	if scale <= 0 || s == "" {
+		return s
+	}
+	dot := strings.IndexByte(s, '.')
+	if dot < 0 {
+		return s + "." + strings.Repeat("0", int(scale))
+	}
+	have := int64(len(s) - dot - 1)
+	if have >= scale {
+		return s
+	}
+	return s + strings.Repeat("0", int(scale-have))
 }
 
 // validateIdentifier accepts ASCII identifiers safe to interpolate into SQL

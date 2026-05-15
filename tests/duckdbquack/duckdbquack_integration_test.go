@@ -351,11 +351,12 @@ func TestDecimalRenderedAsString(t *testing.T) {
 		t.Fatalf("revenue rendered as %T (%v), want string", revenue, revenue)
 	}
 	// Sum of (1000.00 + 250.50 + 120.00) = 1370.50. The duckdb-go Decimal
-	// type's String() strips trailing zeros, so the rendered string is
-	// "1370.5" — the value is preserved, the cosmetic scale is not.
-	// (A future polish could re-format to the column's declared scale.)
-	if s != "1370.5" {
-		t.Fatalf("revenue value: got %q, want %q", s, "1370.5")
+	// type's String() strips trailing zeros, but the source post-processes
+	// it to the column's declared scale (DECIMAL(18,2) on the input column
+	// promotes to DECIMAL(38,2) in the SUM aggregate's result type, so
+	// scale=2).
+	if s != "1370.50" {
+		t.Fatalf("revenue value: got %q, want %q", s, "1370.50")
 	}
 }
 

@@ -107,17 +107,16 @@ order and surfaces truncation cleanly:
 ```
 
 The `type` field on each column is the DuckDB type name as reported by
-`rows.ColumnTypes()`. `DECIMAL` values are rendered as strings by default
-to preserve precision (the duckdb-go driver's `Decimal.String()` strips
-trailing zeros, so `1370.50` is rendered as `"1370.5"` — the numeric value
-is preserved, the cosmetic scale is not). `BLOB` columns are rejected by
-default and replaced with a `<blob: N bytes>` sentinel. `LIST` and
-`STRUCT` columns are rendered as nested JSON arrays and objects.
-`row_count` is the count of rows actually returned; when `policy.max_rows`
-is reached, extra rows are dropped and `truncated` is set to `true`.
-`statement_hash` is the SHA-256 of a whitespace-canonical form of the
-SQL — stable across whitespace changes so it can be logged without
-exposing the SQL text.
+`rows.ColumnTypes()`. `DECIMAL(p,s)` values are rendered as strings to
+preserve precision and are padded to the column's declared scale
+(`1370.50` stays `"1370.50"`, `1000.00` stays `"1000.00"`). `BLOB`
+columns are rejected by default and replaced with a `<blob: N bytes>`
+sentinel. `LIST` and `STRUCT` columns are rendered as nested JSON
+arrays and objects. `row_count` is the count of rows actually
+returned; when `policy.max_rows` is reached, extra rows are dropped
+and `truncated` is set to `true`. `statement_hash` is the SHA-256 of
+a whitespace-canonical form of the SQL — stable across whitespace
+changes so it can be logged without exposing the SQL text.
 
 ## Reference
 

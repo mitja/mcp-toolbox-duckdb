@@ -89,7 +89,7 @@ func (cfg Config) Initialize(srcs map[string]sources.Source) (tools.Tool, error)
 	if len(allowed) == 0 {
 		allowed = DefaultAllowedStatementKinds
 	}
-	if err := ValidateStatement(cfg.Statement, allowed); err != nil {
+	if err := ValidateStatement(cfg.Statement, allowed, policy.ForbiddenPatterns); err != nil {
 		return nil, fmt.Errorf("tool %q: statement rejected by policy: %w", cfg.Name, err)
 	}
 

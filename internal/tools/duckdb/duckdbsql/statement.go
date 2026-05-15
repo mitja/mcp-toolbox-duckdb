@@ -48,10 +48,14 @@ var identTokenRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 // ValidateStatement checks that statement is a single read-only SQL
 // statement whose leading keyword is in allowedKinds and whose normalized
 // form contains no forbidden tokens. It is meant to run once at tool
-// config-load time. It is NOT a SQL sandbox.
+// config-load time (or at every invocation for the dev duckdb-execute-sql
+// tool, which takes agent-supplied SQL). It is NOT a SQL sandbox.
 //
-// allowedKinds is uppercased internally; pass any case.
-func ValidateStatement(statement string, allowedKinds []string) error {
+// allowedKinds is uppercased internally; pass any case. extraForbidden
+// extends the built-in forbiddenSubstrings list with operator-supplied
+// patterns (typically from Source.Policy.ForbiddenPatterns); pass nil to
+// use only the built-in deny list.
+func ValidateStatement(statement string, allowedKinds, extraForbidden []string) error {
 	if strings.TrimSpace(statement) == "" {
 		return fmt.Errorf("statement is empty")
 	}
@@ -83,6 +87,15 @@ func ValidateStatement(statement string, allowedKinds []string) error {
 	for _, bad := range forbiddenSubstrings {
 		if containsToken(upper, bad) {
 			return fmt.Errorf("statement contains forbidden token %q", bad)
+		}
+	}
+	for _, bad := range extraForbidden {
+		needle := strings.ToUpper(strings.TrimSpace(bad))
+		if needle == "" {
+			continue
+		}
+		if containsToken(upper, needle) {
+			return fmt.Errorf("statement contains forbidden token %q (from policy.forbidden_patterns)", bad)
 		}
 	}
 	return nil

@@ -46,10 +46,40 @@ func TestValidateStatement_Accepts(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
-			if err := ValidateStatement(tc.in, DefaultAllowedStatementKinds); err != nil {
+			if err := ValidateStatement(tc.in, DefaultAllowedStatementKinds, nil); err != nil {
 				t.Fatalf("expected accept, got error: %v\nstatement: %q", err, tc.in)
 			}
 		})
+	}
+}
+
+func TestValidateStatement_ExtraForbidden(t *testing.T) {
+	// Baseline: this is accepted by the built-in deny list.
+	if err := ValidateStatement("SELECT export_id FROM remote.sales", DefaultAllowedStatementKinds, nil); err != nil {
+		t.Fatalf("baseline should pass: %v", err)
+	}
+
+	// Adding EXPORT to extraForbidden should make a statement that has
+	// EXPORT as a token fail; "export_id" (which only contains "export"
+	// as a substring) must still pass thanks to word-boundary matching.
+	extra := []string{"EXPORT"}
+	if err := ValidateStatement("SELECT export_id FROM remote.sales", DefaultAllowedStatementKinds, extra); err != nil {
+		t.Fatalf("identifier containing 'export' should not match EXPORT token: %v", err)
+	}
+	if err := ValidateStatement("SELECT 1 EXPORT FROM remote.sales", DefaultAllowedStatementKinds, extra); err == nil {
+		t.Fatalf("statement with bare EXPORT token should be rejected")
+	}
+
+	// Empty / whitespace patterns in the policy list are skipped (so a
+	// trailing empty element in tools.yaml doesn't accidentally reject
+	// everything).
+	if err := ValidateStatement("SELECT 1", DefaultAllowedStatementKinds, []string{"", "   "}); err != nil {
+		t.Fatalf("empty patterns should be skipped: %v", err)
+	}
+
+	// extraForbidden is case-insensitive (we uppercase both sides).
+	if err := ValidateStatement("SELECT export FROM remote.sales", DefaultAllowedStatementKinds, []string{"export"}); err == nil {
+		t.Fatalf("lower-case pattern should still match")
 	}
 }
 
@@ -87,7 +117,7 @@ func TestValidateStatement_Rejects(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
-			err := ValidateStatement(tc.in, DefaultAllowedStatementKinds)
+			err := ValidateStatement(tc.in, DefaultAllowedStatementKinds, nil)
 			if err == nil {
 				t.Fatalf("expected reject, got accept\nstatement: %q", tc.in)
 			}

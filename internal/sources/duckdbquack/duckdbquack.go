@@ -111,6 +111,15 @@ type Policy struct {
 	// the duckdb-sql tool. Empty means "use the tool's built-in default".
 	AllowedStatementKinds []string `yaml:"allowed_statement_kinds"`
 
+	// ForbiddenPatterns is an additional list of case-insensitive SQL
+	// tokens that the statement validator rejects (on top of the built-in
+	// deny list: INSTALL, LOAD, ATTACH, DETACH, CREATE, DROP, ALTER,
+	// INSERT, UPDATE, DELETE, TRUNCATE, MERGE, COPY, GRANT, REVOKE, CALL,
+	// PRAGMA, SET). Each pattern is matched as a whole token, not a
+	// substring, so e.g. "EXPORT" would not reject "exported" but would
+	// reject "EXPORT DATABASE".
+	ForbiddenPatterns []string `yaml:"forbidden_patterns"`
+
 	// MaxRows caps the number of rows returned to the caller. 0 means
 	// "use the default" (1000). Excess rows are dropped and Truncated is
 	// set to true on the result.

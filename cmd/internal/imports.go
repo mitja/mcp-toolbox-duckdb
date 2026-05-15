@@ -117,6 +117,7 @@ import (
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/dataproc/dataproclistjobs"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/dgraph"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/duckdb/duckdbdescribetable"
+	_ "github.com/googleapis/mcp-toolbox/internal/tools/duckdb/duckdbexecutesql"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/duckdb/duckdblistcatalogs"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/duckdb/duckdblistschemas"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/duckdb/duckdblisttables"

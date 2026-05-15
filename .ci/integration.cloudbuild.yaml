@@ -809,6 +809,7 @@ steps:
             "DuckDB Quack" \
             duckdbquack \
             duckdb/duckdbsql \
+            duckdb/duckdbexecutesql \
             duckdb/duckdbmeta \
             duckdb/duckdblistcatalogs \
             duckdb/duckdblistschemas \

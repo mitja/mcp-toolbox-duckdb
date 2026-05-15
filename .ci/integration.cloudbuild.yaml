@@ -789,6 +789,31 @@ steps:
           exit 0
         fi
 
+  - id: "duckdbquack"
+    name: golang:1
+    waitFor: ["compile-test-binary", "detect-changes"]
+    entrypoint: /bin/bash
+    env:
+      - "GOPATH=/gopath"
+    volumes:
+      - name: "go"
+        path: "/gopath"
+    args:
+      - -c
+      - |
+        PATTERN="duckdbquack|duckdb/duckdbsql|internal/server/|.ci/"
+
+        if grep -qE "$$PATTERN" /workspace/changed_files.txt; then
+          echo "Changes detected. Running DuckDB Quack tests..."
+          .ci/test_with_coverage.sh \
+            "DuckDB Quack" \
+            duckdbquack \
+            duckdb/duckdbsql
+        else
+          echo "No relevant changes for DuckDB Quack. Skipping shard."
+          exit 0
+        fi
+
   - id: "couchbase"
     name: golang:1
     waitFor: ["compile-test-binary", "detect-changes"]

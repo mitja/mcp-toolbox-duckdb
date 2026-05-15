@@ -93,20 +93,22 @@ End-to-end JSON response verified through the full Compose stack:
 
 ## CI wiring
 
-`.ci/integration.cloudbuild.yaml` now has a `duckdbquack` step modeled on the SQLite shard. Its detect-changes pattern matches `duckdbquack|duckdb/duckdbsql|internal/server/|.ci/`. Coverage is scoped to the source and tool packages. The shared upstream test suites (`RunToolGetTest`, `RunToolInvokeTest`, `RunMCPToolCallMethod`) are **not** yet wired in — that's Phase 6 polish before the upstream PR.
+`.ci/integration.cloudbuild.yaml` now has a `duckdbquack` step modeled on the SQLite shard. Its detect-changes pattern matches `duckdbquack|duckdb/duckdbsql|internal/server/|.ci/`. Coverage is scoped to the source and tool packages. The shared upstream test suites (`RunToolGetTest`, `RunToolInvokeTest`, `RunMCPToolCallMethod`) are **not** yet wired in — that's Phase 5 polish before the upstream PR.
 
 ## What's explicitly deferred
 
 - **Phase 2** — metadata tools (`duckdb-list-catalogs/schemas/tables`, `duckdb-describe-table`, `duckdb-summarize-table`, `duckdb-quack-whoami`).
 - **Phase 3** — richer policy engine (`forbidden_patterns`, `allowed_catalogs`, `allowed_schemas`, `allowed_tables`), `duckdb-execute-sql` dev tool with explicit-enable gate, server-side hardened auth/authz macros that don't break ATTACH.
 - **Phase 4** — full OpenTelemetry spans/metrics per spec §8.
-- **Phase 5** — reconnect/backoff, connection pooling, multi-remote sources.
-- **Phase 6** — shared `tests/tool.go` suite integration, golangci-lint clean, compatibility test matrix across DuckDB stable + Quack nightly, **file an issue on `googleapis/mcp-toolbox` and open the upstream PR.**
+- **Phase 5** — shared `tests/tool.go` suite integration, golangci-lint clean, compatibility test matrix across DuckDB stable + Quack nightly, **file an issue on `googleapis/mcp-toolbox` and open the upstream PR.**
 
-**Dropped from the original plan: embedded `duckdb` source + `DuckDBRunner` interface refactor.** Remote Quack is the architectural bet that distinguishes this project — lifecycle separation between Toolbox and the analytical runtime — and embedded DuckDB is already trivially achievable via the DuckDB CLI, duckdb-python, or running Quack on the same host and `ATTACH`ing locally. Adding a separate embedded source would dilute the focus and double the maintenance surface without a concrete user need. The `DuckDBRunner` refactor is YAGNI without a second implementation; the current duck-typed `compatibleSource` interface in `duckdbsql` provides the same polymorphism, and moving types into a shared package is a 15-minute mechanical refactor whenever it becomes useful. None of the remaining phases (2–6) depend on either. Reopen the discussion if a concrete user need for embedded DuckDB surfaces later.
+**Dropped from the original plan: embedded `duckdb` source + `DuckDBRunner` interface refactor.** Remote Quack is the architectural bet that distinguishes this project — lifecycle separation between Toolbox and the analytical runtime — and embedded DuckDB is already trivially achievable via the DuckDB CLI, duckdb-python, or running Quack on the same host and `ATTACH`ing locally. Adding a separate embedded source would dilute the focus and double the maintenance surface without a concrete user need. The `DuckDBRunner` refactor is YAGNI without a second implementation; the current duck-typed `compatibleSource` interface in `duckdbsql` provides the same polymorphism, and moving types into a shared package is a 15-minute mechanical refactor whenever it becomes useful. None of the remaining phases (2–5) depend on either. Reopen the discussion if a concrete user need for embedded DuckDB surfaces later.
+
+**Also dropped from the original plan: the dedicated Phase for multi-remote / connection pooling / reconnect / backoff.** Multi-remote sources already work — each YAML `sources:` entry initializes an independent `*sql.DB` with its own ATTACH and Policy. Connection pooling is architecturally N/A for `duckdb-quack`: the ATTACH state lives on a single TCP connection, so `SetMaxOpenConns(1)` is the *correct* setting (mirrors the SQLite source) and exposing a knob would only break the source. Reconnect/backoff is a real concern for Quack specifically (the ATTACH is per-conn, so if the server restarts the next conn from the pool has lost state), but it's a ~30-line targeted change rather than a phase of work — listed below as a Phase-1 polish item.
 
 ## Phase-1 polish items worth doing soon
 
+- Reconnect / re-attach: when the Quack server restarts, the next `*sql.DB` connection the pool hands out has no ATTACH state, and queries against the remote catalog fail. Detect the "Catalog with name '<alias>' does not exist" / `driver.ErrBadConn` / Quack network-error signatures in `Source.RunSQL`, pin a fresh `*sql.Conn`, re-run `LOAD quack` + `CREATE OR REPLACE SECRET` + `DETACH IF EXISTS` + `ATTACH`, and retry the user's query once on that pinned conn. Add an integration test that detaches mid-flight and asserts the next RunSQL recovers. Note: this is the Quack-specific case that upstream's stateless-pool patterns (postgres, cockroachdb, etc.) don't cover.
 - Re-render DECIMAL to its declared scale instead of using `duckdb-go.Decimal.String()` (which strips trailing zeros — `1370.50` → `"1370.5"`). The value is preserved, but cosmetic scale is lost.
 - File an upstream Quack bug for the URI-parser collision when the hostname is `quack`.
 - Run `golangci-lint run --fix` (not installed on the dev machine, will run in CI).
@@ -133,7 +135,7 @@ End-to-end JSON response verified through the full Compose stack:
 - Working branch: `feat/duckdb-quack` ✓ (already created from `main`).
 - Module path: leave as `github.com/googleapis/mcp-toolbox` (do not rename). Local development against the demo/LangGraph side can use `go mod edit -replace` or a `go.work`.
 - Upstream sync cadence: periodically `git fetch upstream main` and merge/rebase. Add `upstream` remote when needed.
-- Eventual upstream path: file a feature-request issue on `googleapis/mcp-toolbox` first (per `DEVELOPER.md`), then send a PR after Phase 1 stabilizes (Phase 6 in our renumbered plan; was Phase 7 in the original spec).
+- Eventual upstream path: file a feature-request issue on `googleapis/mcp-toolbox` first (per `DEVELOPER.md`), then send a PR after Phase 1 stabilizes (Phase 5 in our renumbered plan; was Phase 7 in the original spec).
 
 ---
 
@@ -503,15 +505,14 @@ Code comments must frame this explicitly: "Layer A is developer-tooling sanity. 
 
 ---
 
-## Out of scope (deferred to Phases 2–6)
+## Out of scope (deferred to Phases 2–5)
 
 - Metadata tools: `duckdb-list-tables`, `duckdb-describe-table`, `duckdb-summarize-table`, `duckdb-quack-whoami` — Phase 2.
 - Configurable policy with `forbidden_patterns`, `allowed_catalogs`, `allowed_schemas`, `allowed_tables` — Phase 3.
 - `duckdb-execute-sql` dev tool with explicit-enable gate — Phase 3.
 - Full OpenTelemetry spans/metrics per spec §8 (Phase 1 emits only what upstream chi/router spans give by default) — Phase 4.
-- Connection pooling, reconnect/backoff, multi-remote sources — Phase 5.
-- Compatibility test matrix across DuckDB stable/nightly — Phase 6.
-- Arrow result mode, pagination, server-side result caching, Pydantic AI demo — Phase 6 could-haves.
-- Upstream PR to `googleapis/mcp-toolbox` — after Phase 6 stabilizes the fork.
+- Compatibility test matrix across DuckDB stable/nightly — Phase 5.
+- Arrow result mode, pagination, server-side result caching, Pydantic AI demo — Phase 5 could-haves.
+- Upstream PR to `googleapis/mcp-toolbox` — after Phase 5 stabilizes the fork.
 
-**Dropped from the original spec phase plan:** embedded `duckdb` source (file-backed) and the shared `DuckDBRunner` interface refactor. Remote Quack is the project's distinguishing architectural bet (lifecycle decoupling between Toolbox and DuckDB); adding embedded support would dilute the focus without a concrete user need. The runner refactor is YAGNI until there is a second implementation — the current duck-typed `compatibleSource` interface in `duckdbsql` already provides the polymorphism, and moving types into a shared package would be a quick mechanical refactor if it ever becomes useful. None of Phases 2–6 depend on either.
+**Dropped from the original spec phase plan:** embedded `duckdb` source (file-backed), the shared `DuckDBRunner` interface refactor, and the dedicated phase for multi-remote / connection pooling / reconnect / backoff. Remote Quack is the project's distinguishing architectural bet, embedded support would dilute it, and the runner refactor is YAGNI without a second implementation. Multi-remote already works via independent `sources:` entries. Connection pooling is architecturally N/A — Quack's ATTACH is per-conn, so `SetMaxOpenConns(1)` is the correct value (matching the SQLite source). Reconnect/backoff is a real concern but a targeted ~30-line change — see the Phase-1 polish item above. None of Phases 2–5 depend on any of these.

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -40,14 +41,21 @@ const instrumentationName = "github.com/googleapis/mcp-toolbox/internal/sources/
 // compared to the actual SQL roundtrip.
 func tracer() trace.Tracer { return otel.Tracer(instrumentationName) }
 
-// queryMeter and the metric instruments are bound at init: the global
-// MeterProvider is captured once. Tests that need to assert on metric
-// emissions install their MeterProvider before invoking the package's
-// init() — typically by setting otel.SetMeterProvider in TestMain — but
-// this codebase has no metric-assertion tests yet so the simpler binding
-// suffices.
+// Metric instruments are initialized lazily on first use rather than at
+// package init. The OTel global MeterProvider returned by otel.Meter()
+// before Toolbox has called otel.SetMeterProvider is a no-op; instruments
+// created from that no-op meter do not start emitting later when the real
+// provider is swapped in. Deferring creation until the first RunSQL
+// invocation lets the package see whatever provider is installed by then
+// (in practice: the OTLP / GCP meter Toolbox configured in main()).
+//
+// The downside: SetMeterProvider swaps that happen *after* the first
+// RunSQL are not picked up (the instruments are already cached). For
+// production use this is fine — SetMeterProvider is called once at
+// startup and never again. Tests that assert on metric emissions must
+// install their MeterProvider before invoking RunSQL the first time.
 var (
-	queryMeter = otel.Meter(instrumentationName)
+	metricsOnce sync.Once
 
 	queryDuration  metric.Float64Histogram
 	queryRows      metric.Int64Histogram
@@ -56,48 +64,51 @@ var (
 	queryReattach  metric.Int64Counter
 )
 
-func init() {
-	var err error
-	queryDuration, err = queryMeter.Float64Histogram(
-		"duckdb.query.duration",
-		metric.WithDescription("Latency of a single SQL invocation through duckdb-quack Source.RunSQL."),
-		metric.WithUnit("s"),
-	)
-	if err != nil {
-		panic(fmt.Sprintf("duckdb-quack metric setup (duration): %v", err))
-	}
-	queryRows, err = queryMeter.Int64Histogram(
-		"duckdb.query.rows_returned",
-		metric.WithDescription("Number of rows returned by a single SQL invocation, after MaxRows truncation."),
-		metric.WithUnit("{row}"),
-	)
-	if err != nil {
-		panic(fmt.Sprintf("duckdb-quack metric setup (rows): %v", err))
-	}
-	queryErrors, err = queryMeter.Int64Counter(
-		"duckdb.query.errors_total",
-		metric.WithDescription("Count of SQL invocations that returned an error. Labeled by error.type."),
-		metric.WithUnit("{call}"),
-	)
-	if err != nil {
-		panic(fmt.Sprintf("duckdb-quack metric setup (errors): %v", err))
-	}
-	queryTruncated, err = queryMeter.Int64Counter(
-		"duckdb.query.truncated_total",
-		metric.WithDescription("Count of SQL invocations whose result was truncated by MaxRows."),
-		metric.WithUnit("{call}"),
-	)
-	if err != nil {
-		panic(fmt.Sprintf("duckdb-quack metric setup (truncated): %v", err))
-	}
-	queryReattach, err = queryMeter.Int64Counter(
-		"duckdb.connection.reattach_total",
-		metric.WithDescription("Count of times the source re-attached the remote catalog after a conn drop."),
-		metric.WithUnit("{event}"),
-	)
-	if err != nil {
-		panic(fmt.Sprintf("duckdb-quack metric setup (reattach): %v", err))
-	}
+func ensureMetrics() {
+	metricsOnce.Do(func() {
+		m := otel.Meter(instrumentationName)
+		var err error
+		queryDuration, err = m.Float64Histogram(
+			"duckdb.query.duration",
+			metric.WithDescription("Latency of a single SQL invocation through duckdb-quack Source.RunSQL."),
+			metric.WithUnit("s"),
+		)
+		if err != nil {
+			panic(fmt.Sprintf("duckdb-quack metric setup (duration): %v", err))
+		}
+		queryRows, err = m.Int64Histogram(
+			"duckdb.query.rows_returned",
+			metric.WithDescription("Number of rows returned by a single SQL invocation, after MaxRows truncation."),
+			metric.WithUnit("{row}"),
+		)
+		if err != nil {
+			panic(fmt.Sprintf("duckdb-quack metric setup (rows): %v", err))
+		}
+		queryErrors, err = m.Int64Counter(
+			"duckdb.query.errors_total",
+			metric.WithDescription("Count of SQL invocations that returned an error. Labeled by error.type."),
+			metric.WithUnit("{call}"),
+		)
+		if err != nil {
+			panic(fmt.Sprintf("duckdb-quack metric setup (errors): %v", err))
+		}
+		queryTruncated, err = m.Int64Counter(
+			"duckdb.query.truncated_total",
+			metric.WithDescription("Count of SQL invocations whose result was truncated by MaxRows."),
+			metric.WithUnit("{call}"),
+		)
+		if err != nil {
+			panic(fmt.Sprintf("duckdb-quack metric setup (truncated): %v", err))
+		}
+		queryReattach, err = m.Int64Counter(
+			"duckdb.connection.reattach_total",
+			metric.WithDescription("Count of times the source re-attached the remote catalog after a conn drop."),
+			metric.WithUnit("{event}"),
+		)
+		if err != nil {
+			panic(fmt.Sprintf("duckdb-quack metric setup (reattach): %v", err))
+		}
+	})
 }
 
 // errorType maps an error to a short, stable label suitable for use as the
@@ -131,6 +142,7 @@ func recordOutcome(
 	err error,
 	duration time.Duration,
 ) {
+	ensureMetrics()
 	queryDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(baseAttrs...))
 
 	if res != nil {

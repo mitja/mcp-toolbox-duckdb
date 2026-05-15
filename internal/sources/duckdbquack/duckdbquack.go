@@ -405,6 +405,7 @@ func (s *Source) QuackQuery(ctx context.Context, remoteSQL string, opts QueryOpt
 // dedicated counter so operators can graph the rate independently of the
 // outer query metric.
 func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opts QueryOptions) (*QueryResult, error) {
+	ensureMetrics()
 	start := time.Now()
 	baseAttrs := []attribute.KeyValue{
 		attribute.String("db.system", "duckdb"),

@@ -106,12 +106,21 @@ End-to-end JSON response verified through the full Compose stack:
 
 **Also dropped from the original plan: the dedicated Phase for multi-remote / connection pooling / reconnect / backoff.** Multi-remote sources already work — each YAML `sources:` entry initializes an independent `*sql.DB` with its own ATTACH and Policy. Connection pooling is architecturally N/A for `duckdb-quack`: the ATTACH state lives on a single TCP connection, so `SetMaxOpenConns(1)` is the *correct* setting (mirrors the SQLite source) and exposing a knob would only break the source. Reconnect/backoff is a real concern for Quack specifically (the ATTACH is per-conn, so if the server restarts the next conn from the pool has lost state), but it's a ~30-line targeted change rather than a phase of work — listed below as a Phase-1 polish item.
 
-## Phase-1 polish items worth doing soon
+## Phase-1 polish items
 
-- Reconnect / re-attach: when the Quack server restarts, the next `*sql.DB` connection the pool hands out has no ATTACH state, and queries against the remote catalog fail. Detect the "Catalog with name '<alias>' does not exist" / `driver.ErrBadConn` / Quack network-error signatures in `Source.RunSQL`, pin a fresh `*sql.Conn`, re-run `LOAD quack` + `CREATE OR REPLACE SECRET` + `DETACH IF EXISTS` + `ATTACH`, and retry the user's query once on that pinned conn. Add an integration test that detaches mid-flight and asserts the next RunSQL recovers. Note: this is the Quack-specific case that upstream's stateless-pool patterns (postgres, cockroachdb, etc.) don't cover.
-- Re-render DECIMAL to its declared scale instead of using `duckdb-go.Decimal.String()` (which strips trailing zeros — `1370.50` → `"1370.5"`). The value is preserved, but cosmetic scale is lost.
-- File an upstream Quack bug for the URI-parser collision when the hostname is `quack`.
-- Run `golangci-lint run --fix` (not installed on the dev machine, will run in CI).
+Status as of 2026-05-15:
+
+### Done
+
+- **✅ Reconnect / re-attach when the Quack server restarts.** `Source.RunSQL` now detects reattach-worthy errors (the catalog-missing message that names the alias, `driver.ErrBadConn`, duckdb-go's `Invalid connection id` after a Quack restart, and several Quack network-failure signatures), pins a fresh `*sql.Conn`, re-runs the per-conn bootstrap (`LOAD quack` + `CREATE OR REPLACE SECRET` + `DETACH` + `ATTACH`), and retries the user query once. Generic SQL errors bypass the retry so callers see their original failure verbatim. Verified end-to-end against the demo stack: `docker compose restart quack-server` followed by `curl /api/tool/.../invoke` returns typed JSON, with no caller-visible recovery seam. Commits: `d6f61ebd` (initial implementation, "Catalog … does not exist" + network signatures, integration test that DETACHes mid-flight) and `b883cba0` (adds the `Invalid connection id` pattern after the smoke test surfaced it as the actual production failure, plus a 12-case internal unit test that pins the matcher). Side-fix on the demo side: `mcp-toolbox-duckdb-demo@11ccde5` makes `init.sql` idempotent by wiping `/data/analytics.duckdb` on every container start, so `docker compose restart quack-server` no longer crashes on a duplicate-primary-key from the re-running seed.
+
+### Still pending
+
+- **DECIMAL scale preservation.** `duckdb-go.Decimal.String()` strips trailing zeros (`1370.50` → `"1370.5"`). The numeric value is preserved, but the column's declared scale is not. Fix: read `(precision, scale)` out of the `DECIMAL(p,s)` column type at row time and format the value to that scale ourselves.
+- **Upstream bug filings (do NOT auto-file, see `CLAUDE.local.md`).** Two writeups are already paste-ready in `mcp-toolbox-duckdb-demo/NOTES.md`:
+  1. Quack URI parser confuses hostname `quack` with the scheme keyword.
+  2. `quack_authorization_function` rejects ATTACH's own internal catalog probes, making it impossible to enable authz before clients have attached.
+- **`golangci-lint run --fix`.** Not installed on the dev machine; will run in CI on PR. Worth doing locally before the upstream PR (Phase 5).
 
 ---
 

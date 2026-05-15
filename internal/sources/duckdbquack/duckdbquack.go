@@ -275,9 +275,11 @@ func initClient(ctx context.Context, tracer trace.Tracer, cfg Config) (*sql.DB, 
 	return db, nil
 }
 
-// createQuackSecret creates a DuckDB SECRET of TYPE quack carrying the token
-// and TLS preference. The secret name is scoped to the source name to permit
-// multiple duckdb-quack sources within the same Toolbox process.
+// createQuackSecret creates a DuckDB SECRET of TYPE quack carrying the token.
+// The Quack SECRET schema only accepts TOKEN; TLS preference lives on the
+// ATTACH statement instead (see attachRemote). The secret name is scoped to
+// the source name to permit multiple duckdb-quack sources within the same
+// Toolbox process.
 //
 // CREATE SECRET does not accept bind parameters, so the token is interpolated
 // into the SQL. Token format is enforced by tokenPattern in Initialize, which
@@ -285,8 +287,8 @@ func initClient(ctx context.Context, tracer trace.Tracer, cfg Config) (*sql.DB, 
 func createQuackSecret(ctx context.Context, db *sql.DB, cfg Config) error {
 	secretName := "toolbox_" + sanitizeIdentifier(cfg.Name)
 	stmt := fmt.Sprintf(
-		"CREATE SECRET %s (TYPE quack, TOKEN '%s', DISABLE_SSL %t)",
-		secretName, cfg.Token, cfg.DisableSSL,
+		"CREATE SECRET %s (TYPE quack, TOKEN '%s')",
+		secretName, cfg.Token,
 	)
 	if _, err := db.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("CREATE SECRET for source %q: %w", cfg.Name, err)
@@ -295,9 +297,15 @@ func createQuackSecret(ctx context.Context, db *sql.DB, cfg Config) error {
 }
 
 // attachRemote runs ATTACH against the configured URI. The 'quack:' URI scheme
-// implies TYPE quack; pass it explicitly for clarity.
+// implies TYPE quack; we pass it explicitly for clarity and forward the
+// disable_ssl preference if the user set it. (Quack defaults to plaintext for
+// localhost and TLS otherwise.)
 func attachRemote(ctx context.Context, db *sql.DB, cfg Config) error {
-	stmt := fmt.Sprintf("ATTACH '%s' AS %s (TYPE quack)", cfg.URI, cfg.AttachAlias)
+	opts := "TYPE quack"
+	if cfg.DisableSSL {
+		opts += ", DISABLE_SSL true"
+	}
+	stmt := fmt.Sprintf("ATTACH '%s' AS %s (%s)", cfg.URI, cfg.AttachAlias, opts)
 	if _, err := db.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("ATTACH %q AS %s: %w", cfg.URI, cfg.AttachAlias, err)
 	}

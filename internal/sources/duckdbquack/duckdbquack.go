@@ -35,6 +35,8 @@ import (
 	"github.com/goccy/go-yaml"
 	"github.com/googleapis/mcp-toolbox/internal/sources"
 	"github.com/googleapis/mcp-toolbox/internal/util/orderedmap"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -396,22 +398,48 @@ func (s *Source) QuackQuery(ctx context.Context, remoteSQL string, opts QueryOpt
 // ATTACH bootstrap on it, and retries the user query once on that pinned
 // conn. Detection is conservative (see needsReAttach) — generic SQL errors
 // are returned verbatim so the caller sees the original failure.
+//
+// Instrumentation: wraps the whole call (including any retry) in a child
+// `duckdb.query` span and records the duration, rows-returned, truncated,
+// and error metrics. A reattach is signalled as a span event AND as a
+// dedicated counter so operators can graph the rate independently of the
+// outer query metric.
 func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opts QueryOptions) (*QueryResult, error) {
+	start := time.Now()
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("db.system", "duckdb"),
+		attribute.String("toolbox.source.name", s.Name),
+		attribute.Int("db.statement.parameter_count", len(params)),
+	}
+
+	ctx, span := tracer().Start(ctx, "duckdb.query", trace.WithAttributes(baseAttrs...))
+	defer span.End()
+
 	res, err := s.executeQuery(ctx, s.Db, statement, params, opts)
 	if err == nil || !needsReAttach(err, s.AttachAlias) {
+		recordOutcome(ctx, span, baseAttrs, res, err, time.Since(start))
 		return res, err
 	}
 
+	span.AddEvent("reattach", trace.WithAttributes(attribute.String("trigger.error", err.Error())))
+	queryReattach.Add(ctx, 1, metric.WithAttributes(attribute.String("toolbox.source.name", s.Name)))
+
 	conn, cErr := s.Db.Conn(ctx)
 	if cErr != nil {
-		return nil, fmt.Errorf("query failed: %w (acquiring conn for retry also failed: %v)", err, cErr)
+		wrapped := fmt.Errorf("query failed: %w (acquiring conn for retry also failed: %v)", err, cErr)
+		recordOutcome(ctx, span, baseAttrs, nil, wrapped, time.Since(start))
+		return nil, wrapped
 	}
 	defer conn.Close()
 
 	if raErr := s.reAttachOnConn(ctx, conn); raErr != nil {
-		return nil, fmt.Errorf("query failed: %w (re-attach also failed: %v)", err, raErr)
+		wrapped := fmt.Errorf("query failed: %w (re-attach also failed: %v)", err, raErr)
+		recordOutcome(ctx, span, baseAttrs, nil, wrapped, time.Since(start))
+		return nil, wrapped
 	}
-	return s.executeQuery(ctx, conn, statement, params, opts)
+	res, err = s.executeQuery(ctx, conn, statement, params, opts)
+	recordOutcome(ctx, span, baseAttrs, res, err, time.Since(start))
+	return res, err
 }
 
 // executeQuery runs the SQL on q (either the source's *sql.DB or a pinned

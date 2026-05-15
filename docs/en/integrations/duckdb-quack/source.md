@@ -148,6 +148,46 @@ TCP connection that carries the `ATTACH` state:
 - `MaxOpenConns`: 1 (the `ATTACH` lives on one connection)
 - `MaxIdleConns`: 1 (kept warm so the attach is not lost between calls)
 
+### Observability
+
+The source emits OpenTelemetry telemetry on every `RunSQL` invocation,
+so every `duckdb-*` tool inherits it without per-tool wiring. Spans
+are parented to whatever request span Toolbox's MCP layer already
+creates, so a trace links `MCP request -> tool execution -> SQL`.
+
+**Span**: `duckdb.query`, scope
+`github.com/googleapis/mcp-toolbox/internal/sources/duckdbquack`.
+
+| Attribute                       | Type    | Description                                                                                  |
+|---------------------------------|---------|----------------------------------------------------------------------------------------------|
+| `db.system`                     | string  | Always `"duckdb"`.                                                                           |
+| `toolbox.source.name`           | string  | The source's YAML name (e.g., `sales-quack`).                                                 |
+| `db.statement.parameter_count`  | int     | Number of bound parameters passed to the query.                                              |
+| `db.response.rows`              | int     | Rows actually returned (after `policy.max_rows` truncation).                                 |
+| `db.response.truncated`         | bool    | `true` when `policy.max_rows` capped the result.                                             |
+| `error.type`                    | string  | Set on failure: `deadline_exceeded`, `canceled`, or `error`.                                  |
+
+A `reattach` span event is added when the source recovers a lost
+ATTACH by re-running the per-connection bootstrap; the event carries
+`trigger.error` so you can see what surfaced the recovery.
+
+**Metrics** (scope same as above; recorded on every `RunSQL`):
+
+| Metric                              | Kind            | Unit       | Dimensions                                              |
+|-------------------------------------|-----------------|------------|---------------------------------------------------------|
+| `duckdb.query.duration`             | histogram       | `s`        | source name, parameter count                            |
+| `duckdb.query.rows_returned`        | histogram       | `{row}`    | source name, parameter count                            |
+| `duckdb.query.errors_total`         | counter         | `{call}`   | source name, parameter count, `error.type`              |
+| `duckdb.query.truncated_total`     | counter         | `{call}`   | source name, parameter count                            |
+| `duckdb.connection.reattach_total` | counter         | `{event}`  | source name                                             |
+
+Raw SQL text is never logged or attached to the span — only its
+shape (parameter count) and outcome (rows / truncation / error type).
+The Toolbox-side MCP layer separately records
+`toolbox.tool.execution.duration` per tool invocation, so the inner
+`duckdb.query.duration` plus the outer tool duration give you both
+the SQL-level latency and the end-to-end tool latency.
+
 ### Security model
 
 Defense in depth, applied at three layers:

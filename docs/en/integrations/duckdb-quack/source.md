@@ -80,8 +80,6 @@ secret manager, file).
 ```yaml
 sources:
   sales-quack:
-    kind: source
-    name: sales-quack
     type: duckdb-quack
     uri: quack:duckdb-server:9494
     token: ${QUACK_TOKEN}
@@ -95,8 +93,6 @@ sources:
 
 tools:
   revenue_by_customer:
-    kind: tool
-    name: revenue_by_customer
     type: duckdb-sql
     source: sales-quack
     description: Revenue by customer, filtered by a case-insensitive name pattern.
@@ -117,6 +113,11 @@ toolsets:
   analytics_readonly:
     - revenue_by_customer
 ```
+
+Note: do not include explicit `kind:` or `name:` fields inside a map
+entry — the map key serves as the name, and the kind is inferred from
+the parent (`sources:` → `source`, `tools:` → `tool`). Adding them
+duplicates the name and Toolbox refuses to start.
 
 ## Reference
 

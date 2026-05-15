@@ -116,6 +116,7 @@ import (
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/dataproc/dataproclistclusters"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/dataproc/dataproclistjobs"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/dgraph"
+	_ "github.com/googleapis/mcp-toolbox/internal/tools/duckdb/duckdbsql"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/elasticsearch/elasticsearchesql"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/elasticsearch/elasticsearchexecuteesql"
 	_ "github.com/googleapis/mcp-toolbox/internal/tools/firebird/firebirdexecutesql"

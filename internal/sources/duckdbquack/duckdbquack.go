@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2" // DuckDB driver, registers as "duckdb"
 	"github.com/goccy/go-yaml"
@@ -40,9 +41,11 @@ const SourceType string = "duckdb-quack"
 
 // Defaults applied when the YAML config omits an optional field.
 const (
-	defaultClientDatabase  = ":memory:"
-	defaultAttachAlias     = "remote"
-	defaultInstallFrom     = "core_nightly"
+	defaultClientDatabase = ":memory:"
+	defaultAttachAlias    = "remote"
+	defaultInstallFrom    = "core_nightly"
+	defaultMaxRows        = 1000
+	defaultTimeout        = 30 * time.Second
 )
 
 // tokenPattern restricts Quack tokens to characters that are safe to embed
@@ -83,6 +86,35 @@ type QuackOptions struct {
 	UseSecret *bool `yaml:"use_secret"`
 }
 
+// Policy controls how tools using this source execute SQL: which statement
+// kinds are allowed, how many rows may be returned, and how long a query may
+// run. Tools enforce these at config-load (allowed kinds) and per-invocation
+// (max rows, timeout). The Quack server's own authorization callback is the
+// real security boundary; Policy is defense in depth and developer-ergonomic
+// sanity-checking.
+type Policy struct {
+	// ReadOnly is informational at present; the Quack server's read_only
+	// authorization callback is the enforced boundary.
+	ReadOnly bool `yaml:"read_only"`
+
+	// RejectMultipleStatements rejects SQL containing more than one
+	// statement at tool config-load time. Defaults to true.
+	RejectMultipleStatements *bool `yaml:"reject_multiple_statements"`
+
+	// AllowedStatementKinds is the set of leading keywords accepted by
+	// the duckdb-sql tool. Empty means "use the tool's built-in default".
+	AllowedStatementKinds []string `yaml:"allowed_statement_kinds"`
+
+	// MaxRows caps the number of rows returned to the caller. 0 means
+	// "use the default" (1000). Excess rows are dropped and Truncated is
+	// set to true on the result.
+	MaxRows int `yaml:"max_rows"`
+
+	// Timeout is the per-invocation context deadline applied by the
+	// tool layer. 0 means "use the default" (30s).
+	Timeout time.Duration `yaml:"timeout"`
+}
+
 // Config is the YAML-decoded configuration for a duckdb-quack source.
 type Config struct {
 	Name            string       `yaml:"name" validate:"required"`
@@ -90,10 +122,11 @@ type Config struct {
 	URI             string       `yaml:"uri" validate:"required"`   // e.g., "quack:host:9494"
 	Token           string       `yaml:"token" validate:"required"` // see tokenPattern
 	DisableSSL      bool         `yaml:"disable_ssl"`
-	ClientDatabase  string       `yaml:"client_database"`             // default ":memory:"
-	AttachAlias     string       `yaml:"attach_alias"`                // default "remote"
-	AttachOnStartup *bool        `yaml:"attach_on_startup"`           // default true
+	ClientDatabase  string       `yaml:"client_database"`           // default ":memory:"
+	AttachAlias     string       `yaml:"attach_alias"`              // default "remote"
+	AttachOnStartup *bool        `yaml:"attach_on_startup"`         // default true
 	Quack           QuackOptions `yaml:"quack"`
+	Policy          Policy       `yaml:"policy"`
 }
 
 func (r Config) SourceConfigType() string {
@@ -121,7 +154,23 @@ func (r Config) withDefaults() Config {
 		t := true
 		c.Quack.UseSecret = &t
 	}
+	if c.Policy.RejectMultipleStatements == nil {
+		t := true
+		c.Policy.RejectMultipleStatements = &t
+	}
+	if c.Policy.MaxRows == 0 {
+		c.Policy.MaxRows = defaultMaxRows
+	}
+	if c.Policy.Timeout == 0 {
+		c.Policy.Timeout = defaultTimeout
+	}
 	return c
+}
+
+// EffectivePolicy returns the resolved Policy after defaults are applied.
+// Tools call this to read MaxRows / Timeout / AllowedStatementKinds.
+func (s *Source) EffectivePolicy() Policy {
+	return s.Config.Policy
 }
 
 func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {
@@ -255,15 +304,39 @@ func attachRemote(ctx context.Context, db *sql.DB, cfg Config) error {
 	return nil
 }
 
+// Column describes one column in a QueryResult. Type is the DuckDB type name
+// as reported by rows.ColumnTypes() (e.g., "VARCHAR", "DECIMAL(18,2)").
+type Column struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// QueryResult is the structured response from RunSQL. Tools wrap this with
+// row_count, source name, and statement_hash to produce the spec §7 JSON.
+type QueryResult struct {
+	Columns   []Column         `json:"columns"`
+	Rows      []orderedmap.Row `json:"rows"`
+	Truncated bool             `json:"truncated"`
+}
+
+// QueryOptions carries per-invocation knobs. MaxRows=0 means no row limit.
+type QueryOptions struct {
+	MaxRows int
+}
+
 // RunSQL executes a SQL statement against the client DuckDB (which may
-// reference attached Quack catalog tables) and returns the result as a slice
-// of orderedmap.Row values. Column types are recorded via ColumnTypes() so the
-// result serializer can apply DuckDB-aware type rules.
+// reference attached Quack catalog tables) and returns columns, rows, and a
+// truncation flag. Column types are captured from rows.ColumnTypes() so the
+// caller can apply DuckDB-aware type rules.
 //
-// NOTE: this is the Day 1 baseline implementation. Day 2 will wrap the rows
-// in the {columns, rows, row_count, truncated, source, statement_hash} shape
-// from spec §7 and enforce max_rows / max_bytes / max_cell_bytes.
-func (s *Source) RunSQL(ctx context.Context, statement string, params []any) (any, error) {
+// If opts.MaxRows > 0 and the query produces more rows than MaxRows, the
+// extra rows are drained from the cursor (to release server resources) and
+// Truncated is set to true.
+//
+// NOTE: this is the Day 2 baseline. Day 4 polish will add MaxBytes /
+// MaxCellBytes enforcement and DECIMAL/BLOB/LIST/STRUCT type-specific
+// rendering per spec §7.
+func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opts QueryOptions) (*QueryResult, error) {
 	rows, err := s.Db.QueryContext(ctx, statement, params...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to execute query: %w", err)
@@ -274,16 +347,32 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any) (an
 	if err != nil {
 		return nil, fmt.Errorf("unable to get column names: %w", err)
 	}
-
-	rawValues := make([]any, len(cols))
-	values := make([]any, len(cols))
-	for i := range rawValues {
-		values[i] = &rawValues[i]
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, fmt.Errorf("unable to get column types: %w", err)
+	}
+	columns := make([]Column, len(cols))
+	for i, name := range cols {
+		columns[i] = Column{Name: name, Type: colTypes[i].DatabaseTypeName()}
 	}
 
-	var out []any
+	rawValues := make([]any, len(cols))
+	scanTargets := make([]any, len(cols))
+	for i := range rawValues {
+		scanTargets[i] = &rawValues[i]
+	}
+
+	out := make([]orderedmap.Row, 0)
+	truncated := false
 	for rows.Next() {
-		if err := rows.Scan(values...); err != nil {
+		if opts.MaxRows > 0 && len(out) >= opts.MaxRows {
+			truncated = true
+			// Drain remaining rows so the server-side cursor closes promptly.
+			for rows.Next() {
+			}
+			break
+		}
+		if err := rows.Scan(scanTargets...); err != nil {
 			return nil, fmt.Errorf("unable to scan row: %w", err)
 		}
 		row := orderedmap.Row{}
@@ -295,7 +384,7 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any) (an
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
-	return out, nil
+	return &QueryResult{Columns: columns, Rows: out, Truncated: truncated}, nil
 }
 
 // normalizeValue performs minimal value normalization for the Day 1 baseline.

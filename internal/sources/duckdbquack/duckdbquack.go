@@ -346,6 +346,32 @@ type quackQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+// QuackQuery executes a SQL statement directly on the remote Quack server
+// via the `quack_query()` table function, bypassing the ATTACHed catalog.
+// This is the route for metadata queries that DuckDB does not push down
+// through ATTACH — notably anything against information_schema.tables,
+// information_schema.columns, SHOW TABLES, DESCRIBE, and SUMMARIZE, all of
+// which return empty / fail against the local view of an attached Quack
+// catalog but work cleanly when invoked on the remote server.
+//
+// The token does not need to be passed explicitly: quack_query resolves
+// the matching `CREATE SECRET (TYPE quack, …)` automatically. DisableSSL
+// is forwarded from the source config.
+//
+// remoteSQL is interpolated into the outer query as a string literal, so
+// single quotes inside it are escaped. The URI is similarly escaped (the
+// source already enforces the `quack:` prefix and token format at config
+// load, so the URI is developer-controlled, not agent-controlled).
+func (s *Source) QuackQuery(ctx context.Context, remoteSQL string, opts QueryOptions) (*QueryResult, error) {
+	escapedURI := strings.ReplaceAll(s.URI, "'", "''")
+	escapedSQL := strings.ReplaceAll(remoteSQL, "'", "''")
+	stmt := fmt.Sprintf(
+		"SELECT * FROM quack_query('%s', '%s', disable_ssl := %t)",
+		escapedURI, escapedSQL, s.DisableSSL,
+	)
+	return s.RunSQL(ctx, stmt, nil, opts)
+}
+
 // RunSQL executes a SQL statement against the client DuckDB (which may
 // reference attached Quack catalog tables) and returns columns, rows, and a
 // truncation flag. Column types are captured from rows.ColumnTypes() so the

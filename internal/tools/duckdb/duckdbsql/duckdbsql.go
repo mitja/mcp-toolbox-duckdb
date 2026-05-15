@@ -25,7 +25,6 @@ package duckdbsql
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"net/http"
 
@@ -34,6 +33,7 @@ import (
 	"github.com/googleapis/mcp-toolbox/internal/sources"
 	"github.com/googleapis/mcp-toolbox/internal/sources/duckdbquack"
 	"github.com/googleapis/mcp-toolbox/internal/tools"
+	"github.com/googleapis/mcp-toolbox/internal/tools/duckdb/duckdbmeta"
 	"github.com/googleapis/mcp-toolbox/internal/util"
 	"github.com/googleapis/mcp-toolbox/internal/util/parameters"
 )
@@ -52,16 +52,6 @@ func newConfig(ctx context.Context, name string, decoder *yaml.Decoder) (tools.T
 		return nil, err
 	}
 	return actual, nil
-}
-
-// compatibleSource is the duck-typed contract a Source must satisfy to back
-// a duckdb-sql tool. The duckdb-quack source implements it today; the Phase 2
-// embedded duckdb source will implement it too, letting the same tool target
-// either backend.
-type compatibleSource interface {
-	DuckDBQuackDB() *sql.DB
-	RunSQL(ctx context.Context, statement string, params []any, opts duckdbquack.QueryOptions) (*duckdbquack.QueryResult, error)
-	EffectivePolicy() duckdbquack.Policy
 }
 
 // Config is the YAML-decoded configuration for one duckdb-sql tool.
@@ -89,7 +79,7 @@ func (cfg Config) Initialize(srcs map[string]sources.Source) (tools.Tool, error)
 	if !ok {
 		return nil, fmt.Errorf("tool %q references unknown source %q", cfg.Name, cfg.Source)
 	}
-	src, ok := rawSrc.(compatibleSource)
+	src, ok := rawSrc.(duckdbmeta.CompatibleSource)
 	if !ok {
 		return nil, fmt.Errorf("tool %q: source %q (type %q) is not compatible with %s", cfg.Name, cfg.Source, rawSrc.SourceType(), resourceType)
 	}
@@ -115,7 +105,7 @@ func (cfg Config) Initialize(srcs map[string]sources.Source) (tools.Tool, error)
 		AllParams:     allParameters,
 		manifest:      tools.Manifest{Description: cfg.Description, Parameters: paramManifest, AuthRequired: cfg.AuthRequired},
 		mcpManifest:   mcpManifest,
-		statementHash: StatementHash(cfg.Statement),
+		statementHash: duckdbmeta.StatementHash(cfg.Statement),
 	}, nil
 }
 
@@ -131,18 +121,8 @@ type Tool struct {
 	statementHash string
 }
 
-// Response is the JSON shape returned by Invoke. See spec §7.
-type Response struct {
-	Columns       []duckdbquack.Column `json:"columns"`
-	Rows          []any                `json:"rows"`
-	RowCount      int                  `json:"row_count"`
-	Truncated     bool                 `json:"truncated"`
-	Source        string               `json:"source"`
-	StatementHash string               `json:"statement_hash"`
-}
-
 func (t Tool) Invoke(ctx context.Context, resourceMgr tools.SourceProvider, params parameters.ParamValues, _ tools.AccessToken) (any, util.ToolboxError) {
-	source, err := tools.GetCompatibleSource[compatibleSource](resourceMgr, t.Source, t.Name, t.Type)
+	source, err := tools.GetCompatibleSource[duckdbmeta.CompatibleSource](resourceMgr, t.Source, t.Name, t.Type)
 	if err != nil {
 		return nil, util.NewClientServerError("source used is not compatible with the tool", http.StatusInternalServerError, err)
 	}
@@ -157,30 +137,13 @@ func (t Tool) Invoke(ctx context.Context, resourceMgr tools.SourceProvider, para
 		return nil, util.NewAgentError("unable to extract standard params", err)
 	}
 
-	policy := source.EffectivePolicy()
-	ctx, cancel := context.WithTimeout(ctx, policy.Timeout)
-	defer cancel()
-
-	res, runErr := source.RunSQL(ctx, newStatement, newParams.AsSlice(), duckdbquack.QueryOptions{MaxRows: policy.MaxRows})
+	resp, runErr := duckdbmeta.Invoke(ctx, source, t.Source, t.statementHash, func(ctx context.Context, opts duckdbquack.QueryOptions) (*duckdbquack.QueryResult, error) {
+		return source.RunSQL(ctx, newStatement, newParams.AsSlice(), opts)
+	})
 	if runErr != nil {
 		return nil, util.ProcessGeneralError(runErr)
 	}
-
-	// orderedmap.Row marshals as a JSON object preserving column order, so
-	// the per-row type is opaque to this layer. Wrap in []any for the
-	// response struct.
-	rows := make([]any, len(res.Rows))
-	for i := range res.Rows {
-		rows[i] = res.Rows[i]
-	}
-	return Response{
-		Columns:       res.Columns,
-		Rows:          rows,
-		RowCount:      len(res.Rows),
-		Truncated:     res.Truncated,
-		Source:        t.Source,
-		StatementHash: t.statementHash,
-	}, nil
+	return resp, nil
 }
 
 func (t Tool) EmbedParams(ctx context.Context, paramValues parameters.ParamValues, embeddingModelsMap map[string]embeddingmodels.EmbeddingModel) (parameters.ParamValues, error) {

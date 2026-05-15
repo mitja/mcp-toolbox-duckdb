@@ -37,6 +37,9 @@ func (f *fakeSource) DuckDBQuackDB() *sql.DB         { return nil }
 func (f *fakeSource) RunSQL(_ context.Context, _ string, _ []any, _ duckdbquack.QueryOptions) (*duckdbquack.QueryResult, error) {
 	return &duckdbquack.QueryResult{}, nil
 }
+func (f *fakeSource) QuackQuery(_ context.Context, _ string, _ duckdbquack.QueryOptions) (*duckdbquack.QueryResult, error) {
+	return &duckdbquack.QueryResult{}, nil
+}
 func (f *fakeSource) EffectivePolicy() duckdbquack.Policy { return f.policy }
 
 func TestInitialize_AcceptsValidStatement(t *testing.T) {

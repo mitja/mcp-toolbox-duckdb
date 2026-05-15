@@ -98,20 +98,6 @@ func TestValidateStatement_Rejects(t *testing.T) {
 	}
 }
 
-func TestStatementHash(t *testing.T) {
-	h1 := StatementHash("SELECT 1")
-	h2 := StatementHash("  SELECT\n  1  ")
-	if h1 != h2 {
-		t.Fatalf("expected canonical hash to be whitespace-insensitive, got %s vs %s", h1, h2)
-	}
-	if !strings.HasPrefix(h1, "sha256:") {
-		t.Fatalf("expected sha256: prefix, got %s", h1)
-	}
-	if len(h1) != len("sha256:")+64 {
-		t.Fatalf("expected 64 hex chars after prefix, got %s", h1)
-	}
-	h3 := StatementHash("SELECT 2")
-	if h3 == h1 {
-		t.Fatalf("different statements should hash differently")
-	}
-}
+// TestStatementHash moved to duckdbmeta package after StatementHash and
+// canonicalize were promoted there (all duckdb-* tools share one hashing
+// helper now). See internal/tools/duckdb/duckdbmeta/duckdbmeta_test.go.

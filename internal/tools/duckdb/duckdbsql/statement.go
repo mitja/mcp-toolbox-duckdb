@@ -15,8 +15,6 @@
 package duckdbsql
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
@@ -88,37 +86,6 @@ func ValidateStatement(statement string, allowedKinds []string) error {
 		}
 	}
 	return nil
-}
-
-// StatementHash returns "sha256:<hex>" of a canonical form of the statement
-// (whitespace collapsed, trimmed). It is used as a stable identifier in
-// telemetry without exposing the SQL text itself.
-func StatementHash(statement string) string {
-	canon := canonicalize(statement)
-	sum := sha256.Sum256([]byte(canon))
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-// canonicalize collapses runs of whitespace to a single space and trims.
-// Comments and string contents are preserved so two statements that differ
-// only in string contents still hash differently — that's deliberate, since
-// the developer controls the statement and bound values are not interpolated
-// into the hashed text.
-func canonicalize(s string) string {
-	var b strings.Builder
-	prevSpace := false
-	for _, r := range s {
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
-			if !prevSpace {
-				b.WriteByte(' ')
-				prevSpace = true
-			}
-			continue
-		}
-		prevSpace = false
-		b.WriteRune(r)
-	}
-	return strings.TrimSpace(b.String())
 }
 
 // stripStringsAndComments returns the input with string literals and comment

@@ -150,12 +150,12 @@ func (t Tool) EmbedParams(ctx context.Context, paramValues parameters.ParamValue
 	return parameters.EmbedParams(ctx, t.AllParams, paramValues, embeddingModelsMap, nil)
 }
 
-func (t Tool) Manifest() tools.Manifest                   { return t.manifest }
-func (t Tool) McpManifest() tools.McpManifest             { return t.mcpManifest }
-func (t Tool) Authorized(verified []string) bool          { return tools.IsAuthorized(t.AuthRequired, verified) }
-func (t Tool) ToConfig() tools.ToolConfig                 { return t.Config }
-func (t Tool) GetParameters() parameters.Parameters       { return t.AllParams }
-func (t Tool) GetScopesRequired() []string                { return t.ScopesRequired }
+func (t Tool) Manifest() tools.Manifest             { return t.manifest }
+func (t Tool) McpManifest() tools.McpManifest       { return t.mcpManifest }
+func (t Tool) Authorized(verified []string) bool    { return tools.IsAuthorized(t.AuthRequired, verified) }
+func (t Tool) ToConfig() tools.ToolConfig           { return t.Config }
+func (t Tool) GetParameters() parameters.Parameters { return t.AllParams }
+func (t Tool) GetScopesRequired() []string          { return t.ScopesRequired }
 func (t Tool) GetAuthTokenHeaderName(_ tools.SourceProvider) (string, error) {
 	return "Authorization", nil
 }

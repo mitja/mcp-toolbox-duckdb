@@ -139,9 +139,9 @@ type Config struct {
 	URI             string       `yaml:"uri" validate:"required"`   // e.g., "quack:host:9494"
 	Token           string       `yaml:"token" validate:"required"` // see tokenPattern
 	DisableSSL      bool         `yaml:"disable_ssl"`
-	ClientDatabase  string       `yaml:"client_database"`           // default ":memory:"
-	AttachAlias     string       `yaml:"attach_alias"`              // default "remote"
-	AttachOnStartup *bool        `yaml:"attach_on_startup"`         // default true
+	ClientDatabase  string       `yaml:"client_database"`   // default ":memory:"
+	AttachAlias     string       `yaml:"attach_alias"`      // default "remote"
+	AttachOnStartup *bool        `yaml:"attach_on_startup"` // default true
 	Quack           QuackOptions `yaml:"quack"`
 	Policy          Policy       `yaml:"policy"`
 }
@@ -187,7 +187,7 @@ func (r Config) withDefaults() Config {
 // EffectivePolicy returns the resolved Policy after defaults are applied.
 // Tools call this to read MaxRows / Timeout / AllowedStatementKinds.
 func (s *Source) EffectivePolicy() Policy {
-	return s.Config.Policy
+	return s.Policy
 }
 
 func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.Source, error) {

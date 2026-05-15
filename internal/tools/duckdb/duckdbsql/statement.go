@@ -107,7 +107,8 @@ func ValidateStatement(statement string, allowedKinds, extraForbidden []string) 
 // allowed) — that flag drives the multi-statement rejection.
 //
 // Supported tokens:
-//   - `'...'`     single-quoted strings, `''` is a literal quote
+//   - `'...'`     single-quoted strings (a doubled single quote inside
+//     is the SQL escape for a literal quote)
 //   - `E'...'`    DuckDB escape strings, `\` is the escape character
 //   - `"..."`     quoted identifiers, `""` is a literal double-quote
 //   - `--...\n`   line comments

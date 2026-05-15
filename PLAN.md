@@ -86,23 +86,24 @@ End-to-end JSON response verified through the full Compose stack:
 
 - **In-process Quack server for integration tests.** A second `sql.Open("duckdb", "")` in the test process hosts `quack_serve`, the client Source ATTACHes to it via localhost on a random free port. No Docker, no testcontainers, no external dependencies; the full integration test suite (8 cases including the parameter-binding matrix and DECIMAL/BLOB rendering) runs in under 3 seconds.
 - **Three-layer defense in depth.** (1) Tool config-load validator catches developer mistakes; (2) per-invocation `policy.timeout` and `policy.max_rows`; (3) Quack server-side `quack_authorization_function = 'read_only'` as the real boundary. The implementation, docs, and demo README all repeat this framing.
-- **Source policy is the authority.** Tools read `MaxRows`, `Timeout`, and `AllowedStatementKinds` via the source's `EffectivePolicy()` method, so multiple tools sharing a source share the policy. The `compatibleSource` interface in `duckdbsql` requires this method, so Phase 2's embedded `duckdb` source will plug in identically.
+- **Source policy is the authority.** Tools read `MaxRows`, `Timeout`, and `AllowedStatementKinds` via the source's `EffectivePolicy()` method, so multiple tools sharing a source share the policy. The `compatibleSource` interface in `duckdbsql` is duck-typed, so a future second DuckDB-backed source (if one ever lands) can plug in identically without changing the tool — but no such source is currently planned.
 - **Statement validator with comment-aware scanning.** Handles `'..'`, `E'..'`, `".."`, `--`, `/* */`, doubled-quote escapes. `SELECT 'do not DROP this'` and `SELECT 1 -- DROP TABLE x` pass; `DROP TABLE x` and `SELECT 1; SELECT 2` fail. 19 accept + 22 reject unit cases.
 - **DECIMAL → string via the column-type guard.** `renderValue` only calls `String()` when the column type starts with `DECIMAL`, so other Stringer types (notably `time.Time`) keep their normal JSON marshaling (RFC-3339).
 - **BLOB rejected with a sentinel**, not an error. Replaces the cell with `"<blob: N bytes>"` so a single BLOB column doesn't kill the whole query. A future `result.allow_blob: true` opt-in is possible.
 
 ## CI wiring
 
-`.ci/integration.cloudbuild.yaml` now has a `duckdbquack` step modeled on the SQLite shard. Its detect-changes pattern matches `duckdbquack|duckdb/duckdbsql|internal/server/|.ci/`. Coverage is scoped to the source and tool packages. The shared upstream test suites (`RunToolGetTest`, `RunToolInvokeTest`, `RunMCPToolCallMethod`) are **not** yet wired in — that's Phase 7 polish before the upstream PR.
+`.ci/integration.cloudbuild.yaml` now has a `duckdbquack` step modeled on the SQLite shard. Its detect-changes pattern matches `duckdbquack|duckdb/duckdbsql|internal/server/|.ci/`. Coverage is scoped to the source and tool packages. The shared upstream test suites (`RunToolGetTest`, `RunToolInvokeTest`, `RunMCPToolCallMethod`) are **not** yet wired in — that's Phase 6 polish before the upstream PR.
 
 ## What's explicitly deferred
 
-- **Phase 2** — embedded `duckdb` source (file-backed) + shared `DuckDBRunner` interface refactor so types live outside the duckdb-quack package.
-- **Phase 3** — metadata tools (`duckdb-list-catalogs/schemas/tables`, `duckdb-describe-table`, `duckdb-summarize-table`, `duckdb-quack-whoami`).
-- **Phase 4** — richer policy engine (`forbidden_patterns`, `allowed_catalogs`, `allowed_schemas`, `allowed_tables`), `duckdb-execute-sql` dev tool with explicit-enable gate, server-side hardened auth/authz macros that don't break ATTACH.
-- **Phase 5** — full OpenTelemetry spans/metrics per spec §8.
-- **Phase 6** — reconnect/backoff, connection pooling, multi-remote sources.
-- **Phase 7** — shared `tests/tool.go` suite integration, golangci-lint clean, compatibility test matrix across DuckDB stable + Quack nightly, **file an issue on `googleapis/mcp-toolbox` and open the upstream PR.**
+- **Phase 2** — metadata tools (`duckdb-list-catalogs/schemas/tables`, `duckdb-describe-table`, `duckdb-summarize-table`, `duckdb-quack-whoami`).
+- **Phase 3** — richer policy engine (`forbidden_patterns`, `allowed_catalogs`, `allowed_schemas`, `allowed_tables`), `duckdb-execute-sql` dev tool with explicit-enable gate, server-side hardened auth/authz macros that don't break ATTACH.
+- **Phase 4** — full OpenTelemetry spans/metrics per spec §8.
+- **Phase 5** — reconnect/backoff, connection pooling, multi-remote sources.
+- **Phase 6** — shared `tests/tool.go` suite integration, golangci-lint clean, compatibility test matrix across DuckDB stable + Quack nightly, **file an issue on `googleapis/mcp-toolbox` and open the upstream PR.**
+
+**Dropped from the original plan: embedded `duckdb` source + `DuckDBRunner` interface refactor.** Remote Quack is the architectural bet that distinguishes this project — lifecycle separation between Toolbox and the analytical runtime — and embedded DuckDB is already trivially achievable via the DuckDB CLI, duckdb-python, or running Quack on the same host and `ATTACH`ing locally. Adding a separate embedded source would dilute the focus and double the maintenance surface without a concrete user need. The `DuckDBRunner` refactor is YAGNI without a second implementation; the current duck-typed `compatibleSource` interface in `duckdbsql` provides the same polymorphism, and moving types into a shared package is a 15-minute mechanical refactor whenever it becomes useful. None of the remaining phases (2–6) depend on either. Reopen the discussion if a concrete user need for embedded DuckDB surfaces later.
 
 ## Phase-1 polish items worth doing soon
 
@@ -132,14 +133,13 @@ End-to-end JSON response verified through the full Compose stack:
 - Working branch: `feat/duckdb-quack` ✓ (already created from `main`).
 - Module path: leave as `github.com/googleapis/mcp-toolbox` (do not rename). Local development against the demo/LangGraph side can use `go mod edit -replace` or a `go.work`.
 - Upstream sync cadence: periodically `git fetch upstream main` and merge/rebase. Add `upstream` remote when needed.
-- Eventual upstream path: file a feature-request issue on `googleapis/mcp-toolbox` first (per `DEVELOPER.md`), then send a PR after Phase 1 stabilizes (Phase 7 in the spec).
+- Eventual upstream path: file a feature-request issue on `googleapis/mcp-toolbox` first (per `DEVELOPER.md`), then send a PR after Phase 1 stabilizes (Phase 6 in our renumbered plan; was Phase 7 in the original spec).
 
 ---
 
 ## Code layout
 
 ```
-internal/sources/duckdb/                          # Phase 2 (embedded) — stub for now
 internal/sources/duckdbquack/
     duckdbquack.go                                # Config, Source, Register(), Initialize, RunSQL
     duckdbquack_test.go
@@ -229,7 +229,7 @@ type Config struct {
 - `func (s *Source) SourceType() string`, `func (s *Source) ToConfig() any`
 - Type-unique getter: `func (s *Source) DuckDBQuackDB() *sql.DB { return s.Db }` (this is the duck-typed compat marker the tool will require — mirrors `SQLiteDB()`/`PostgresPool()` upstream)
 - `func (s *Source) RunSQL(ctx, statement string, params []any) (any, error)`
-- `func (s *Source) Close() error` — flushes WAL (matters in Phase 2, wire it now)
+- `func (s *Source) Close() error` — flushes WAL on persistent databases (no-op for `:memory:` but cheap to wire)
 
 **Initialize flow:**
 1. `db, _ := sql.Open("duckdb", "")` — in-memory client.
@@ -259,7 +259,7 @@ type compatibleSource interface {
     RunSQL(context.Context, string, []any) (any, error)
 }
 ```
-The Phase 2 embedded `duckdb` source will also implement this — same tool will work against both backends (key spec design goal).
+The duck-typed shape keeps the tool decoupled from any specific source struct, so a hypothetical future DuckDB-backed source (e.g., embedded, if a concrete need ever surfaces) could plug in without changing the tool. No such source is planned.
 
 **Statement policy validation at config-load** (in `Tool.Initialize`, runs once at server start — satisfies "tool with `DROP TABLE` fails validation"):
 1. Trim, strip trailing `;`.
@@ -503,15 +503,15 @@ Code comments must frame this explicitly: "Layer A is developer-tooling sanity. 
 
 ---
 
-## Out of scope (deferred to Phases 2–7)
+## Out of scope (deferred to Phases 2–6)
 
-- Embedded `duckdb` source (file-backed) — Phase 2.
-- Shared `DuckDBRunner` interface refactor — Phase 2.
-- Metadata tools: `duckdb-list-tables`, `duckdb-describe-table`, `duckdb-summarize-table`, `duckdb-quack-whoami` — Phase 3.
-- Configurable policy with `forbidden_patterns`, `allowed_catalogs`, `allowed_schemas`, `allowed_tables` — Phase 4.
-- `duckdb-execute-sql` dev tool with explicit-enable gate — Phase 4.
-- Full OpenTelemetry spans/metrics per spec §8 (Phase 1 emits only what upstream chi/router spans give by default) — Phase 5.
-- Connection pooling, reconnect/backoff, multi-remote sources — Phase 6.
-- Compatibility test matrix across DuckDB stable/nightly — Phase 7.
-- Arrow result mode, pagination, server-side result caching, Pydantic AI demo — Phase 7 could-haves.
-- Upstream PR to `googleapis/mcp-toolbox` — after Phase 7 stabilizes the fork.
+- Metadata tools: `duckdb-list-tables`, `duckdb-describe-table`, `duckdb-summarize-table`, `duckdb-quack-whoami` — Phase 2.
+- Configurable policy with `forbidden_patterns`, `allowed_catalogs`, `allowed_schemas`, `allowed_tables` — Phase 3.
+- `duckdb-execute-sql` dev tool with explicit-enable gate — Phase 3.
+- Full OpenTelemetry spans/metrics per spec §8 (Phase 1 emits only what upstream chi/router spans give by default) — Phase 4.
+- Connection pooling, reconnect/backoff, multi-remote sources — Phase 5.
+- Compatibility test matrix across DuckDB stable/nightly — Phase 6.
+- Arrow result mode, pagination, server-side result caching, Pydantic AI demo — Phase 6 could-haves.
+- Upstream PR to `googleapis/mcp-toolbox` — after Phase 6 stabilizes the fork.
+
+**Dropped from the original spec phase plan:** embedded `duckdb` source (file-backed) and the shared `DuckDBRunner` interface refactor. Remote Quack is the project's distinguishing architectural bet (lifecycle decoupling between Toolbox and DuckDB); adding embedded support would dilute the focus without a concrete user need. The runner refactor is YAGNI until there is a second implementation — the current duck-typed `compatibleSource` interface in `duckdbsql` already provides the polymorphism, and moving types into a shared package would be a quick mechanical refactor if it ever becomes useful. None of Phases 2–6 depend on either.

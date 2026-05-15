@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -404,6 +405,75 @@ func lookupRowField(t *testing.T, row any, field string) any {
 		t.Fatalf("field %q not present in row: %+v", field, m)
 	}
 	return v
+}
+
+// TestReAttach_RecoversFromMissingCatalog proves that Source.RunSQL detects
+// a lost ATTACH (here simulated by issuing DETACH directly through the
+// underlying *sql.DB) and transparently re-bootstraps the conn before
+// retrying the user query.
+//
+// This exercises the same code path that fires when the Quack server
+// restarts and the database/sql pool replaces the now-bad TCP connection
+// with a fresh one that has no ATTACH state. Detaching is the most
+// deterministic way to reproduce the "catalog gone, but the conn still
+// works" half of that scenario inside a single-process test.
+func TestReAttach_RecoversFromMissingCatalog(t *testing.T) {
+	srv := startInProcessQuackServer(t)
+	src := newSource(t, srv, duckdbquack.Policy{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Sanity: query works before we break anything.
+	if _, err := src.RunSQL(ctx, "SELECT id FROM remote.sales LIMIT 1", nil, duckdbquack.QueryOptions{}); err != nil {
+		t.Fatalf("baseline query: %v", err)
+	}
+
+	// Simulate ATTACH loss by detaching directly through the underlying *sql.DB.
+	if _, err := src.DuckDBQuackDB().ExecContext(ctx, "DETACH remote"); err != nil {
+		t.Fatalf("manual DETACH: %v", err)
+	}
+
+	// A raw query through *sql.DB now fails — no reconnect logic there.
+	if _, err := src.DuckDBQuackDB().QueryContext(ctx, "SELECT id FROM remote.sales LIMIT 1"); err == nil {
+		t.Fatalf("expected raw query to fail after DETACH, got nil")
+	}
+
+	// RunSQL must detect the missing catalog and re-attach transparently.
+	res, err := src.RunSQL(ctx, "SELECT id FROM remote.sales ORDER BY id LIMIT 1", nil, duckdbquack.QueryOptions{})
+	if err != nil {
+		t.Fatalf("RunSQL after DETACH should auto-reattach, got: %v", err)
+	}
+	if len(res.Rows) != 1 {
+		t.Fatalf("expected 1 row after reattach, got %d", len(res.Rows))
+	}
+
+	// And a subsequent query should also work, confirming the re-attach
+	// stuck rather than being one-shot.
+	if _, err := src.RunSQL(ctx, "SELECT count(*) FROM remote.sales", nil, duckdbquack.QueryOptions{}); err != nil {
+		t.Fatalf("second post-reattach query: %v", err)
+	}
+}
+
+// TestReAttach_DoesNotMaskUnrelatedErrors confirms that errors which are
+// *not* signals of lost ATTACH (here: a syntactically invalid statement) are
+// returned verbatim, without going through the retry path.
+func TestReAttach_DoesNotMaskUnrelatedErrors(t *testing.T) {
+	srv := startInProcessQuackServer(t)
+	src := newSource(t, srv, duckdbquack.Policy{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := src.RunSQL(ctx, "SELECT id FROM remote.sales WHERE", nil, duckdbquack.QueryOptions{})
+	if err == nil {
+		t.Fatalf("expected syntax error, got nil")
+	}
+	// A re-attach retry would surface "(re-attach also failed: …)" in the
+	// error chain; the original syntax error should pass through cleanly.
+	if strings.Contains(err.Error(), "re-attach") {
+		t.Fatalf("syntax error should not trigger re-attach path; got %v", err)
+	}
 }
 
 // TestServerSideAuthz_RejectsInsert proves that the read-only authorization

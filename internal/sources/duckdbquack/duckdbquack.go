@@ -24,6 +24,8 @@ package duckdbquack
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -331,6 +333,14 @@ type QueryOptions struct {
 	MaxRows int
 }
 
+// quackQuerier is the subset of *sql.DB / *sql.Conn that executeQuery
+// needs. Splitting it out lets RunSQL re-execute a query on a pinned
+// *sql.Conn during the re-attach recovery path without duplicating the
+// row-scanning code.
+type quackQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
 // RunSQL executes a SQL statement against the client DuckDB (which may
 // reference attached Quack catalog tables) and returns columns, rows, and a
 // truncation flag. Column types are captured from rows.ColumnTypes() so the
@@ -340,11 +350,34 @@ type QueryOptions struct {
 // extra rows are drained from the cursor (to release server resources) and
 // Truncated is set to true.
 //
-// NOTE: this is the Day 2 baseline. Day 4 polish will add MaxBytes /
-// MaxCellBytes enforcement and DECIMAL/BLOB/LIST/STRUCT type-specific
-// rendering per spec §7.
+// Reconnect path: if the first attempt fails with an error that suggests the
+// ATTACH was lost (server restart, conn replaced by the pool, etc.), RunSQL
+// pins a fresh *sql.Conn from the pool, re-runs the LOAD / CREATE SECRET /
+// ATTACH bootstrap on it, and retries the user query once on that pinned
+// conn. Detection is conservative (see needsReAttach) — generic SQL errors
+// are returned verbatim so the caller sees the original failure.
 func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opts QueryOptions) (*QueryResult, error) {
-	rows, err := s.Db.QueryContext(ctx, statement, params...)
+	res, err := s.executeQuery(ctx, s.Db, statement, params, opts)
+	if err == nil || !needsReAttach(err, s.AttachAlias) {
+		return res, err
+	}
+
+	conn, cErr := s.Db.Conn(ctx)
+	if cErr != nil {
+		return nil, fmt.Errorf("query failed: %w (acquiring conn for retry also failed: %v)", err, cErr)
+	}
+	defer conn.Close()
+
+	if raErr := s.reAttachOnConn(ctx, conn); raErr != nil {
+		return nil, fmt.Errorf("query failed: %w (re-attach also failed: %v)", err, raErr)
+	}
+	return s.executeQuery(ctx, conn, statement, params, opts)
+}
+
+// executeQuery runs the SQL on q (either the source's *sql.DB or a pinned
+// *sql.Conn) and serializes the rows per spec §7.
+func (s *Source) executeQuery(ctx context.Context, q quackQuerier, statement string, params []any, opts QueryOptions) (*QueryResult, error) {
+	rows, err := q.QueryContext(ctx, statement, params...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to execute query: %w", err)
 	}
@@ -392,6 +425,80 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opt
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
 	return &QueryResult{Columns: columns, Rows: out, Truncated: truncated}, nil
+}
+
+// needsReAttach decides whether an error from a user query suggests the
+// ATTACH state was lost on the underlying conn and a re-bootstrap should be
+// attempted. Conservative: only triggers on patterns that are deterministic
+// signals of lost ATTACH (DuckDB's catalog-missing message naming the alias
+// or driver.ErrBadConn) or known Quack-side network failures. Generic SQL
+// errors (syntax errors, type errors, etc.) bypass the retry path so the
+// caller sees the original failure verbatim.
+func needsReAttach(err error, alias string) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	msg := err.Error()
+	// DuckDB's message when an attached catalog disappears mentions both the
+	// alias and "does not exist". Match conservatively on both substrings to
+	// avoid colliding with unrelated "does not exist" errors (e.g., table
+	// missing inside an existing catalog).
+	if strings.Contains(msg, alias) && strings.Contains(msg, "does not exist") {
+		return true
+	}
+	// Quack HTTP-side failures the duckdb-go driver surfaces as plain errors.
+	for _, sig := range []string{
+		"Failed to send message",
+		"Failed to receive message",
+		"Could not connect",
+		"Connection reset",
+	} {
+		if strings.Contains(msg, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// reAttachOnConn re-runs the per-connection bootstrap (LOAD quack +
+// CREATE OR REPLACE SECRET + DETACH + ATTACH) on a freshly-pinned conn so
+// the subsequent query retry can reference the remote catalog again.
+//
+// The DETACH is best-effort: on a brand-new conn the alias does not exist
+// yet, so DETACH errors; on a conn where ATTACH is still active, DETACH
+// clears it before we re-ATTACH. Swallowing the error keeps the function
+// idempotent.
+//
+// INSTALL is *not* re-run — the Quack extension binary is cached process-wide
+// after the first install, and reinstalling on every reconnect would slow
+// recovery significantly.
+func (s *Source) reAttachOnConn(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, "LOAD quack"); err != nil {
+		return fmt.Errorf("LOAD quack: %w", err)
+	}
+	if s.Quack.UseSecret != nil && *s.Quack.UseSecret {
+		secretName := "toolbox_" + sanitizeIdentifier(s.Name)
+		stmt := fmt.Sprintf(
+			"CREATE OR REPLACE SECRET %s (TYPE quack, TOKEN '%s')",
+			secretName, s.Token,
+		)
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("CREATE OR REPLACE SECRET: %w", err)
+		}
+	}
+	_, _ = conn.ExecContext(ctx, fmt.Sprintf("DETACH %s", s.AttachAlias))
+	opts := "TYPE quack"
+	if s.DisableSSL {
+		opts += ", DISABLE_SSL true"
+	}
+	stmt := fmt.Sprintf("ATTACH '%s' AS %s (%s)", s.URI, s.AttachAlias, opts)
+	if _, err := conn.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("ATTACH: %w", err)
+	}
+	return nil
 }
 
 // renderValue applies the per-column-type rules from spec §7 to one cell.

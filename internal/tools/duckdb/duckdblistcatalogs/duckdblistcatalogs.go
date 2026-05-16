@@ -85,14 +85,11 @@ func (cfg Config) Initialize(srcs map[string]sources.Source) (tools.Tool, error)
 	if err != nil {
 		return nil, err
 	}
-	annotations := tools.GetAnnotationsOrDefault(cfg.Annotations, tools.NewReadOnlyAnnotations)
-	mcpManifest := tools.GetMcpManifest(cfg.Name, cfg.Description, cfg.AuthRequired, allParameters, annotations)
 
 	return Tool{
 		Config:        cfg,
 		AllParams:     allParameters,
 		manifest:      tools.Manifest{Description: cfg.Description, Parameters: paramManifest, AuthRequired: cfg.AuthRequired},
-		mcpManifest:   mcpManifest,
 		statementHash: duckdbmeta.StatementHash(statement),
 	}, nil
 }
@@ -103,7 +100,6 @@ type Tool struct {
 	Config
 	AllParams     parameters.Parameters `yaml:"allParams"`
 	manifest      tools.Manifest
-	mcpManifest   tools.McpManifest
 	statementHash string
 }
 
@@ -125,8 +121,13 @@ func (t Tool) EmbedParams(ctx context.Context, paramValues parameters.ParamValue
 	return parameters.EmbedParams(ctx, t.AllParams, paramValues, embeddingModelsMap, nil)
 }
 
-func (t Tool) Manifest() tools.Manifest             { return t.manifest }
-func (t Tool) McpManifest() tools.McpManifest       { return t.mcpManifest }
+func (t Tool) Manifest() tools.Manifest  { return t.manifest }
+func (t Tool) GetName() string           { return t.Name }
+func (t Tool) GetDescription() string    { return t.Description }
+func (t Tool) GetAuthRequired() []string { return t.AuthRequired }
+func (t Tool) GetAnnotations() *tools.ToolAnnotations {
+	return tools.GetAnnotationsOrDefault(t.Annotations, tools.NewReadOnlyAnnotations)
+}
 func (t Tool) Authorized(verified []string) bool    { return tools.IsAuthorized(t.AuthRequired, verified) }
 func (t Tool) ToConfig() tools.ToolConfig           { return t.Config }
 func (t Tool) GetParameters() parameters.Parameters { return t.AllParams }

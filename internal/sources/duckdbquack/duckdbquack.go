@@ -132,18 +132,40 @@ type Policy struct {
 	Timeout time.Duration `yaml:"timeout"`
 }
 
+// Attachment describes one additional Quack ATTACH within a single
+// duckdb-quack source — used to wire two or more remote Quack catalogs
+// into one in-process DuckDB so cross-catalog queries (joins, UNIONs) can
+// execute locally. The primary attachment is described by the top-level
+// URI / Token / DisableSSL / AttachAlias fields on Config; entries in
+// Config.AdditionalAttachments describe extras.
+//
+// Each additional attachment gets its own SCOPED CREATE SECRET (TYPE
+// quack, TOKEN '…', SCOPE 'quack:host:port') so DuckDB's secret resolver
+// picks the right token per URI. The primary attachment's secret remains
+// un-scoped for backward compatibility with single-source configs.
+//
+// Token and DisableSSL on an Attachment are optional and inherit from
+// the source's primary values when empty / unset.
+type Attachment struct {
+	URI         string `yaml:"uri" validate:"required"`
+	AttachAlias string `yaml:"attach_alias" validate:"required"`
+	Token       string `yaml:"token"`
+	DisableSSL  *bool  `yaml:"disable_ssl"`
+}
+
 // Config is the YAML-decoded configuration for a duckdb-quack source.
 type Config struct {
-	Name            string       `yaml:"name" validate:"required"`
-	Type            string       `yaml:"type" validate:"required"`
-	URI             string       `yaml:"uri" validate:"required"`   // e.g., "quack:host:9494"
-	Token           string       `yaml:"token" validate:"required"` // see tokenPattern
-	DisableSSL      bool         `yaml:"disable_ssl"`
-	ClientDatabase  string       `yaml:"client_database"`   // default ":memory:"
-	AttachAlias     string       `yaml:"attach_alias"`      // default "remote"
-	AttachOnStartup *bool        `yaml:"attach_on_startup"` // default true
-	Quack           QuackOptions `yaml:"quack"`
-	Policy          Policy       `yaml:"policy"`
+	Name                  string       `yaml:"name" validate:"required"`
+	Type                  string       `yaml:"type" validate:"required"`
+	URI                   string       `yaml:"uri" validate:"required"`   // e.g., "quack:host:9494"
+	Token                 string       `yaml:"token" validate:"required"` // see tokenPattern
+	DisableSSL            bool         `yaml:"disable_ssl"`
+	ClientDatabase        string       `yaml:"client_database"`        // default ":memory:"
+	AttachAlias           string       `yaml:"attach_alias"`           // default "remote"
+	AttachOnStartup       *bool        `yaml:"attach_on_startup"`      // default true
+	AdditionalAttachments []Attachment `yaml:"additional_attachments"` // optional; for cross-catalog queries
+	Quack                 QuackOptions `yaml:"quack"`
+	Policy                Policy       `yaml:"policy"`
 }
 
 func (r Config) SourceConfigType() string {
@@ -201,6 +223,29 @@ func (r Config) Initialize(ctx context.Context, tracer trace.Tracer) (sources.So
 	}
 	if err := validateIdentifier(cfg.AttachAlias); err != nil {
 		return nil, fmt.Errorf("duckdb-quack source %q: invalid attach_alias: %w", cfg.Name, err)
+	}
+
+	// Validate every additional attachment, and check alias uniqueness
+	// across the full set so DuckDB does not see a duplicate ATTACH AS
+	// at init or reattach.
+	seenAliases := map[string]struct{}{cfg.AttachAlias: {}}
+	for i, ext := range cfg.AdditionalAttachments {
+		if !strings.HasPrefix(ext.URI, "quack:") {
+			return nil, fmt.Errorf("duckdb-quack source %q: additional_attachments[%d].uri must start with \"quack:\", got %q", cfg.Name, i, ext.URI)
+		}
+		if err := validateIdentifier(ext.AttachAlias); err != nil {
+			return nil, fmt.Errorf("duckdb-quack source %q: additional_attachments[%d].attach_alias: %w", cfg.Name, i, err)
+		}
+		if _, dup := seenAliases[ext.AttachAlias]; dup {
+			return nil, fmt.Errorf("duckdb-quack source %q: duplicate attach_alias %q across attachments", cfg.Name, ext.AttachAlias)
+		}
+		seenAliases[ext.AttachAlias] = struct{}{}
+		// Token is optional on additional attachments; if set, must pass
+		// the same character-set guard as the primary token so it is
+		// safe to interpolate into CREATE SECRET.
+		if ext.Token != "" && !tokenPattern.MatchString(ext.Token) {
+			return nil, fmt.Errorf("duckdb-quack source %q: additional_attachments[%d].token: must match %s", cfg.Name, i, tokenPattern)
+		}
 	}
 
 	db, err := initClient(ctx, tracer, cfg)
@@ -287,6 +332,21 @@ func initClient(ctx context.Context, tracer trace.Tracer, cfg Config) (*sql.DB, 
 			_ = db.Close()
 			return nil, err
 		}
+		// Each additional attachment gets its own scoped secret + ATTACH,
+		// in the order the user declared them. Failure on any one aborts
+		// init so the source is never half-attached.
+		for i, ext := range cfg.AdditionalAttachments {
+			if cfg.Quack.UseSecret != nil && *cfg.Quack.UseSecret {
+				if err := createExtraQuackSecret(ctx, db, cfg, ext); err != nil {
+					_ = db.Close()
+					return nil, fmt.Errorf("additional_attachments[%d]: %w", i, err)
+				}
+			}
+			if err := attachExtra(ctx, db, cfg, ext); err != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("additional_attachments[%d]: %w", i, err)
+			}
+		}
 	}
 
 	return db, nil
@@ -325,6 +385,83 @@ func attachRemote(ctx context.Context, db *sql.DB, cfg Config) error {
 	stmt := fmt.Sprintf("ATTACH '%s' AS %s (%s)", cfg.URI, cfg.AttachAlias, opts)
 	if _, err := db.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("ATTACH %q AS %s: %w", cfg.URI, cfg.AttachAlias, err)
+	}
+	return nil
+}
+
+// effectiveAttachmentToken returns the token to use for an additional
+// attachment: its own Token if set, otherwise the source's primary
+// Token. This lets a multi-attach config share a token across servers
+// without repeating it.
+func effectiveAttachmentToken(cfg Config, ext Attachment) string {
+	if ext.Token != "" {
+		return ext.Token
+	}
+	return cfg.Token
+}
+
+// effectiveAttachmentDisableSSL returns the TLS preference for an
+// additional attachment: its own DisableSSL if set, otherwise the
+// source's primary DisableSSL.
+func effectiveAttachmentDisableSSL(cfg Config, ext Attachment) bool {
+	if ext.DisableSSL != nil {
+		return *ext.DisableSSL
+	}
+	return cfg.DisableSSL
+}
+
+// extraSecretName builds the SECRET name used for one additional
+// attachment. Suffixing with the attachment alias keeps the name unique
+// even when multiple extras share the source name.
+func extraSecretName(cfg Config, ext Attachment) string {
+	return "toolbox_" + sanitizeIdentifier(cfg.Name) + "__" + sanitizeIdentifier(ext.AttachAlias)
+}
+
+// createExtraQuackSecret creates a SCOPEd quack secret for one extra
+// attachment. The scope is the attachment URI; DuckDB's secret resolver
+// picks the longest-matching scope at ATTACH time, so each ATTACH ends
+// up paired with its corresponding token regardless of how many quack
+// secrets exist in the same DuckDB process.
+//
+// Token format is enforced by tokenPattern (either at the source level
+// for inherited tokens, or per-attachment for explicit ones), so the
+// interpolation is safe.
+func createExtraQuackSecret(ctx context.Context, db *sql.DB, cfg Config, ext Attachment) error {
+	token := effectiveAttachmentToken(cfg, ext)
+	stmt := fmt.Sprintf(
+		"CREATE SECRET %s (TYPE quack, TOKEN '%s', SCOPE '%s')",
+		extraSecretName(cfg, ext), token, strings.ReplaceAll(ext.URI, "'", "''"),
+	)
+	if _, err := db.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("CREATE SECRET %s: %w", extraSecretName(cfg, ext), err)
+	}
+	return nil
+}
+
+// attachExtra runs ATTACH for one additional attachment. Same syntax as
+// attachRemote; broken out so init / reattach can call it in a loop.
+// DisableSSL is inherited from the source's primary value when the
+// per-attachment field is unset (mirrors effectiveAttachmentDisableSSL).
+func attachExtra(ctx context.Context, db quackExecer, cfg Config, ext Attachment) error {
+	return execAttach(ctx, db, ext.URI, ext.AttachAlias, effectiveAttachmentDisableSSL(cfg, ext))
+}
+
+// quackExecer is the subset of *sql.DB and *sql.Conn that attachExtra
+// and the reattach helpers need. Lets the same helper run during init
+// (on *sql.DB) and during reattach (on a pinned *sql.Conn).
+type quackExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// execAttach issues one ATTACH statement against the given exec target.
+func execAttach(ctx context.Context, ex quackExecer, uri, alias string, disableSSL bool) error {
+	opts := "TYPE quack"
+	if disableSSL {
+		opts += ", DISABLE_SSL true"
+	}
+	stmt := fmt.Sprintf("ATTACH '%s' AS %s (%s)", uri, alias, opts)
+	if _, err := ex.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("ATTACH %q AS %s: %w", uri, alias, err)
 	}
 	return nil
 }
@@ -417,7 +554,7 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opt
 	defer span.End()
 
 	res, err := s.executeQuery(ctx, s.Db, statement, params, opts)
-	if err == nil || !needsReAttach(err, s.AttachAlias) {
+	if err == nil || !needsReAttach(err, s.allAliases()...) {
 		recordOutcome(ctx, span, baseAttrs, res, err, time.Since(start))
 		return res, err
 	}
@@ -511,11 +648,16 @@ func (s *Source) executeQuery(ctx context.Context, q quackQuerier, statement str
 // needsReAttach decides whether an error from a user query suggests the
 // ATTACH state was lost on the underlying conn and a re-bootstrap should be
 // attempted. Conservative: only triggers on patterns that are deterministic
-// signals of lost ATTACH (DuckDB's catalog-missing message naming the alias
-// or driver.ErrBadConn) or known Quack-side network failures. Generic SQL
-// errors (syntax errors, type errors, etc.) bypass the retry path so the
-// caller sees the original failure verbatim.
-func needsReAttach(err error, alias string) bool {
+// signals of lost ATTACH (DuckDB's catalog-missing message naming one of the
+// known aliases, or driver.ErrBadConn) or known Quack-side network failures.
+// Generic SQL errors (syntax errors, type errors, etc.) bypass the retry path
+// so the caller sees the original failure verbatim.
+//
+// aliases is the full list of ATTACH aliases known to the source: the
+// primary plus any from AdditionalAttachments. Any one of them missing is
+// enough to trigger reattach since the source's reattach path
+// re-attaches them all.
+func needsReAttach(err error, aliases ...string) bool {
 	if err == nil {
 		return false
 	}
@@ -527,8 +669,10 @@ func needsReAttach(err error, alias string) bool {
 	// alias and "does not exist". Match conservatively on both substrings to
 	// avoid colliding with unrelated "does not exist" errors (e.g., table
 	// missing inside an existing catalog).
-	if strings.Contains(msg, alias) && strings.Contains(msg, "does not exist") {
-		return true
+	for _, alias := range aliases {
+		if alias != "" && strings.Contains(msg, alias) && strings.Contains(msg, "does not exist") {
+			return true
+		}
 	}
 	// duckdb-go-bindings surfaces "Invalid Input Error: Invalid connection
 	// id" when the underlying TCP conn to the Quack server has gone bad
@@ -553,14 +697,30 @@ func needsReAttach(err error, alias string) bool {
 	return false
 }
 
+// allAliases returns the full set of ATTACH aliases this source owns —
+// the primary alias plus every alias from AdditionalAttachments. Used by
+// needsReAttach to recognize a "catalog X does not exist" error against
+// any of them.
+func (s *Source) allAliases() []string {
+	out := make([]string, 0, 1+len(s.AdditionalAttachments))
+	out = append(out, s.AttachAlias)
+	for _, ext := range s.AdditionalAttachments {
+		out = append(out, ext.AttachAlias)
+	}
+	return out
+}
+
 // reAttachOnConn re-runs the per-connection bootstrap (LOAD quack +
 // CREATE OR REPLACE SECRET + DETACH + ATTACH) on a freshly-pinned conn so
-// the subsequent query retry can reference the remote catalog again.
+// the subsequent query retry can reference every attached remote catalog
+// again. With multi-attach, every alias is re-bootstrapped in declared
+// order — the primary first, then each additional attachment — so a
+// retry can reference any of them.
 //
-// The DETACH is best-effort: on a brand-new conn the alias does not exist
-// yet, so DETACH errors; on a conn where ATTACH is still active, DETACH
-// clears it before we re-ATTACH. Swallowing the error keeps the function
-// idempotent.
+// The DETACH is best-effort: on a brand-new conn an alias does not exist
+// yet, so DETACH errors; on a conn where an ATTACH is still active,
+// DETACH clears it before we re-ATTACH. Swallowing the error keeps the
+// function idempotent.
 //
 // INSTALL is *not* re-run — the Quack extension binary is cached process-wide
 // after the first install, and reinstalling on every reconnect would slow
@@ -569,24 +729,44 @@ func (s *Source) reAttachOnConn(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "LOAD quack"); err != nil {
 		return fmt.Errorf("LOAD quack: %w", err)
 	}
-	if s.Quack.UseSecret != nil && *s.Quack.UseSecret {
+	useSecret := s.Quack.UseSecret != nil && *s.Quack.UseSecret
+
+	// Primary: un-scoped secret (matches the init-time behavior) +
+	// best-effort DETACH + ATTACH.
+	if useSecret {
 		secretName := "toolbox_" + sanitizeIdentifier(s.Name)
 		stmt := fmt.Sprintf(
 			"CREATE OR REPLACE SECRET %s (TYPE quack, TOKEN '%s')",
 			secretName, s.Token,
 		)
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("CREATE OR REPLACE SECRET: %w", err)
+			return fmt.Errorf("CREATE OR REPLACE SECRET (primary): %w", err)
 		}
 	}
 	_, _ = conn.ExecContext(ctx, fmt.Sprintf("DETACH %s", s.AttachAlias))
-	opts := "TYPE quack"
-	if s.DisableSSL {
-		opts += ", DISABLE_SSL true"
+	if err := execAttach(ctx, conn, s.URI, s.AttachAlias, s.DisableSSL); err != nil {
+		return fmt.Errorf("ATTACH (primary): %w", err)
 	}
-	stmt := fmt.Sprintf("ATTACH '%s' AS %s (%s)", s.URI, s.AttachAlias, opts)
-	if _, err := conn.ExecContext(ctx, stmt); err != nil {
-		return fmt.Errorf("ATTACH: %w", err)
+
+	// Additional attachments: each gets its own scoped secret +
+	// best-effort DETACH + ATTACH. Failure on any one aborts so the
+	// caller's retry doesn't surface a partial state.
+	for i, ext := range s.AdditionalAttachments {
+		if useSecret {
+			stmt := fmt.Sprintf(
+				"CREATE OR REPLACE SECRET %s (TYPE quack, TOKEN '%s', SCOPE '%s')",
+				extraSecretName(s.Config, ext),
+				effectiveAttachmentToken(s.Config, ext),
+				strings.ReplaceAll(ext.URI, "'", "''"),
+			)
+			if _, err := conn.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("CREATE OR REPLACE SECRET (additional_attachments[%d]): %w", i, err)
+			}
+		}
+		_, _ = conn.ExecContext(ctx, fmt.Sprintf("DETACH %s", ext.AttachAlias))
+		if err := execAttach(ctx, conn, ext.URI, ext.AttachAlias, effectiveAttachmentDisableSSL(s.Config, ext)); err != nil {
+			return fmt.Errorf("ATTACH (additional_attachments[%d]): %w", i, err)
+		}
 	}
 	return nil
 }

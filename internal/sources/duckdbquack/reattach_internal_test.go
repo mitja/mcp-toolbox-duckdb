@@ -101,3 +101,49 @@ func TestNeedsReAttach(t *testing.T) {
 		})
 	}
 }
+
+// TestNeedsReAttach_MultiAlias asserts the variadic signature: any one of
+// the declared aliases appearing in a "does not exist" error is enough
+// to trigger reattach. This is what makes multi-attach safe under the
+// "one catalog disappeared, re-bootstrap them all" retry policy.
+func TestNeedsReAttach_MultiAlias(t *testing.T) {
+	cases := []struct {
+		desc    string
+		err     error
+		aliases []string
+		want    bool
+	}{
+		{
+			"primary alias disappeared",
+			errors.New(`Catalog Error: Catalog with name "sales_remote" does not exist!`),
+			[]string{"sales_remote", "inventory_remote"},
+			true,
+		},
+		{
+			"additional alias disappeared",
+			errors.New(`Catalog Error: Catalog with name "inventory_remote" does not exist!`),
+			[]string{"sales_remote", "inventory_remote"},
+			true,
+		},
+		{
+			"unrelated alias in error — not ours",
+			errors.New(`Catalog Error: Catalog with name "elsewhere" does not exist!`),
+			[]string{"sales_remote", "inventory_remote"},
+			false,
+		},
+		{
+			"empty alias list still catches driver.ErrBadConn",
+			driver.ErrBadConn,
+			nil,
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			got := needsReAttach(tc.err, tc.aliases...)
+			if got != tc.want {
+				t.Fatalf("needsReAttach(%q, %v) = %v; want %v", tc.err, tc.aliases, got, tc.want)
+			}
+		})
+	}
+}

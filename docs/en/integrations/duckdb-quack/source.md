@@ -132,6 +132,7 @@ duplicates the name and Toolbox refuses to start.
 | `client_database`     | string      | false        | `":memory:"`   | DuckDB database used by the in-process client. Persistent files work, but the only state the client holds is the `ATTACH`. |
 | `attach_alias`        | string      | false        | `"remote"`     | Catalog name under which the remote DuckDB is attached. Tools reference tables as `<alias>.<table>`.           |
 | `attach_on_startup`   | boolean     | false        | `true`         | Set to `false` to defer `ATTACH` to first tool invocation.                                                     |
+| `additional_attachments` | list     | false        | `[]`           | Optional extra Quack servers to ATTACH into the same in-process DuckDB. Each entry needs `uri` and `attach_alias`; `token` and `disable_ssl` default to the source's primary values when omitted. Enables cross-catalog queries (see Advanced Usage). |
 | `quack.install_from`  | string      | false        | `"core_nightly"`| DuckDB extension repository to install Quack from. Pin to a stable repository for reproducible deployments.   |
 | `quack.use_secret`    | boolean     | false        | `true`         | When true, the token is stored in a per-source `CREATE SECRET (TYPE quack, …)` and the `ATTACH` reads it implicitly. |
 | `policy.read_only`    | boolean     | false        | `false`        | Informational; the Quack server's `quack_authorization_function` is the enforced boundary.                     |
@@ -206,3 +207,90 @@ Defense in depth, applied at three layers:
 
 Agents never construct SQL fragments; they only supply bound parameter
 values. The statement itself is fixed by the developer in `tools.yaml`.
+
+## Advanced Usage
+
+### Multi-attach: cross-catalog queries
+
+A duckdb-quack source can `ATTACH` more than one Quack server into the
+same in-process DuckDB so a single tool can join across catalogs.
+Declare the primary attachment via the top-level fields and list extras
+under `additional_attachments`:
+
+```yaml
+sources:
+  combined-analytics:
+    type: duckdb-quack
+    uri: quack:sales-server:9494
+    token: ${QUACK_TOKEN}
+    disable_ssl: true
+    attach_alias: sales_remote
+    additional_attachments:
+      - uri: quack:inventory-server:9494
+        attach_alias: inventory_remote
+        # token and disable_ssl optional; inherit from the source above
+        # when unset. Set explicitly here when the second server uses
+        # a different token or TLS preference.
+
+tools:
+  product_orders_overview:
+    type: duckdb-sql
+    source: combined-analytics
+    statement: |
+      SELECT p.name, p.category, COALESCE(SUM(o.qty), 0) AS units_ordered
+      FROM inventory_remote.products p
+      LEFT JOIN sales_remote.orders o ON o.product = p.name
+      GROUP BY p.name, p.category
+      ORDER BY units_ordered DESC
+```
+
+Each extra attachment gets its own scoped DuckDB `SECRET` (`SCOPE
+'quack:host:port'`) so the right token is paired with the right `ATTACH`
+even when multiple Quack servers are wired in. Alias uniqueness is
+enforced at config load — two attachments cannot share an `attach_alias`
+within a single source.
+
+The reconnect path covers every alias the source owns: a single error
+that names any one of them (or a generic bad-conn signal from the
+underlying TCP) triggers a re-bootstrap of *all* the attachments on a
+fresh pool connection.
+
+A runnable end-to-end example, including a second Quack server in the
+Compose stack and the `product_orders_overview` tool, lives in the
+[demo repo](https://github.com/mitja/mcp-toolbox-duckdb-demo). See the
+"Cross-catalog queries and pushdown" section in its README for the
+command + expected output.
+
+### Where queries actually run (pushdown)
+
+A duckdb-quack tool's SQL is executed by the *in-process* DuckDB; the
+Quack extension implements a remote-scan operator under each ATTACHed
+catalog. The split:
+
+- **Pushes down to the remote**: projections (the column list reaching
+  `remote.<table>`) and filters (`WHERE` predicates on attached columns).
+  Only the resulting rows cross the TCP boundary.
+- **Runs locally on the Toolbox-side DuckDB**: joins, aggregates,
+  sort/limit, and any function the remote scanner does not push
+  through. Local working memory therefore scales with the *operator's*
+  intermediate state (e.g., the hash table size of a `GROUP BY`), not
+  with the underlying remote table size.
+
+Two consequences worth designing around:
+
+1. **Cross-catalog joins are a local-side cost.** A `JOIN` across
+   `additional_attachments` aliases forces both sides to be pulled
+   back to the local DuckDB before the join operator runs. Single-source
+   tools push much more work to the remote and stay cheap on the
+   Toolbox side.
+2. **Metadata tools (`duckdb-list-tables`, `duckdb-describe-table`,
+   `duckdb-summarize-table`) bypass ATTACH entirely.** They route their
+   SQL through Quack's `quack_query()` table function, which is a full
+   SQL passthrough — the entire statement is shipped to the remote and
+   executed there. Local materialization is essentially zero for these.
+
+The demo repo's README has a "Cross-catalog queries and pushdown"
+section with concrete do/don't examples (project narrowly, filter
+early, prefer single-source aggregates, always set `LIMIT` for
+top-N tools) — they apply uniformly to `duckdb-sql` tools regardless
+of how many attachments a source has.

@@ -83,6 +83,39 @@ func TestParseFromYamlDuckDBQuack(t *testing.T) {
 				},
 			},
 		},
+		{
+			desc: "with additional_attachments",
+			in: `
+            kind: source
+            name: combined-quack
+            type: duckdb-quack
+            uri: quack:sales-server:9494
+            token: shared-team-token
+            disable_ssl: true
+            attach_alias: sales_remote
+            additional_attachments:
+              - uri: quack:inventory-server:9494
+                attach_alias: inventory_remote
+              - uri: quack:audit-server:9494
+                attach_alias: audit_remote
+                token: audit-only-token
+                disable_ssl: false
+            `,
+			want: map[string]sources.SourceConfig{
+				"combined-quack": duckdbquack.Config{
+					Name:        "combined-quack",
+					Type:        duckdbquack.SourceType,
+					URI:         "quack:sales-server:9494",
+					Token:       "shared-team-token",
+					DisableSSL:  true,
+					AttachAlias: "sales_remote",
+					AdditionalAttachments: []duckdbquack.Attachment{
+						{URI: "quack:inventory-server:9494", AttachAlias: "inventory_remote"},
+						{URI: "quack:audit-server:9494", AttachAlias: "audit_remote", Token: "audit-only-token", DisableSSL: ptr(false)},
+					},
+				},
+			},
+		},
 	}
 	for _, tc := range tcs {
 		t.Run(tc.desc, func(t *testing.T) {
@@ -134,6 +167,32 @@ func TestFailParseFromYaml(t *testing.T) {
             foo: bar
             `,
 			errSubstr: `unknown field "foo"`,
+		},
+		{
+			desc: "additional_attachments missing uri",
+			in: `
+            kind: source
+            name: q
+            type: duckdb-quack
+            uri: quack:x:9494
+            token: analytics-team-token
+            additional_attachments:
+              - attach_alias: extra
+            `,
+			errSubstr: "Field validation for 'URI' failed on the 'required' tag",
+		},
+		{
+			desc: "additional_attachments missing attach_alias",
+			in: `
+            kind: source
+            name: q
+            type: duckdb-quack
+            uri: quack:x:9494
+            token: analytics-team-token
+            additional_attachments:
+              - uri: quack:y:9494
+            `,
+			errSubstr: "Field validation for 'AttachAlias' failed on the 'required' tag",
 		},
 	}
 	for _, tc := range tcs {

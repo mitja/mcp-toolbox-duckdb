@@ -19,6 +19,13 @@
 [![Java SDK](https://img.shields.io/maven-central/v/com.google.cloud.mcp/mcp-toolbox-sdk-java?logo=apache-maven&logoColor=white&label=Java%20SDK)](https://mvnrepository.com/artifact/com.google.cloud.mcp/mcp-toolbox-sdk-java)
 </div>
 
+<!-- BEGIN fork-specific note — strip this block before opening an upstream PR. -->
+> [!NOTE]
+> **Fork-specific note (not part of upstream `googleapis/mcp-toolbox`).** This fork ([`mitja/mcp-toolbox-duckdb`](https://github.com/mitja/mcp-toolbox-duckdb), working branch `feat/duckdb-quack`) adds a `duckdb-quack` source and the `duckdb-sql` / metadata / `duckdb-execute-sql` tools wired to it. End-to-end demo stack lives at [`mitja/mcp-toolbox-duckdb-demo`](https://github.com/mitja/mcp-toolbox-duckdb-demo).
+>
+> The adapter here and the sibling demo repo were developed with [Claude Code](https://claude.com/claude-code) (Anthropic's agentic CLI, Opus 4.7 at `xhigh` reasoning) doing the bulk of the iterative work — design discussions, the Go source/tool packages, integration tests, the Compose stack, docs, and architecture diagrams — under human review and direction. The upstream contribution path (`googleapis/mcp-toolbox`) is human-driven from this fork as a base.
+<!-- END fork-specific note -->
+
 MCP Toolbox for Databases is an open source Model Context Protocol (MCP) server that connects your AI agents, IDEs, and applications directly to your enterprise databases. 
 
 <p align="center">

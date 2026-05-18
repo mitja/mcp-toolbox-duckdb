@@ -295,7 +295,6 @@ early, prefer single-source aggregates, always set `LIMIT` for
 top-N tools) — they apply uniformly to `duckdb-sql` tools regardless
 of how many attachments a source has.
 
-
 ### Federating other data behind the remote Quack
 
 Because the remote behind a `duckdb-quack` source is itself a DuckDB
@@ -306,3 +305,61 @@ scanners, and Iceberg/Delta extensions all work this way. The remote
 does the read; the Toolbox-side in-process DuckDB just sees a normal
 view via the attached alias. The demo repo's "Parquet behind a
 remote Quack" section walks through a working `read_parquet` example.
+
+### Pushing a whole tool's statement to the remote (`push_down_to_remote`)
+
+A `duckdb-sql` tool that joins two or more ATTACHed-catalog tables in
+one statement can hit DuckDB's *"Multiple streaming scans or streaming
+scans + CTAS / insert in the same query are not currently supported"*
+error: the local DuckDB cannot drive more than one streaming-scan
+source per pipeline today, so a join across two `remote.<table>`
+references fails to plan. Setting `push_down_to_remote: true` on the
+tool routes the entire statement through Quack's `quack_query()`
+table function: the SQL is shipped to the remote, executed next to
+the data, and only the result rows stream back as a single scan.
+
+```yaml
+tools:
+  current_prices:
+    type: duckdb-sql
+    source: inventory-quack
+    description: Join the products table with the open-ended row in
+                 the parquet-backed price-history view.
+    push_down_to_remote: true
+    statement: |
+      SELECT p.name, p.category, h.unit_price AS current_price
+      FROM   products p
+      LEFT JOIN product_price_history h
+             ON h.product_name = p.name AND h.valid_to IS NULL
+      ORDER BY p.category, p.name
+```
+
+The `statement` is the SQL that will run on the remote, so table
+names are *unqualified* (no `attach_alias` prefix). Two constraints to
+know:
+
+- **The source must be a `duckdb-quack` source.** The flag uses that
+  source's primary URI as the `quack_query()` target. Config load
+  rejects the flag against any other source type.
+- **No bound `parameters:` are allowed when the flag is set.**
+  `quack_query()` takes the inner SQL as a string literal and DuckDB
+  does not bind `?` markers inside string literals. Use
+  `templateParameters` (substituted into the statement before the
+  push-down wrap) if the tool needs operator-controlled
+  parameterization, or omit the flag and write `quack_query(...)`
+  manually if you must keep `?` parameters.
+
+For a multi-attach (cross-source) tool, `push_down_to_remote` does
+not apply — there is no single remote that holds all the referenced
+tables. In that case, see the cross-catalog tip in the demo repo's
+README: split the work into single-source tools and let the agent
+do the second hop, or keep the join local and accept that both
+inputs materialize on the Toolbox side. If you still need to push
+to one specific remote, write `quack_query('<uri>', '<sql>', …)`
+explicitly in your statement.
+
+When the streaming-scan error fires from a query the operator
+wrote (typically while iterating on a `tools.yaml` change), the
+adapter rewrites the cryptic DuckDB message into one that names the
+`push_down_to_remote` flag and the manual `quack_query()` wrapper,
+so the route to the fix is visible in the tool's error response.

@@ -22,6 +22,7 @@ import (
 
 	"github.com/googleapis/mcp-toolbox/internal/sources"
 	"github.com/googleapis/mcp-toolbox/internal/sources/duckdbquack"
+	"github.com/googleapis/mcp-toolbox/internal/util/parameters"
 )
 
 // fakeSource implements sources.Source AND the compatibleSource interface used
@@ -117,5 +118,99 @@ func TestInitialize_RejectsUnknownSource(t *testing.T) {
 	_, err := cfg.Initialize(map[string]sources.Source{})
 	if err == nil || !strings.Contains(err.Error(), "unknown source") {
 		t.Fatalf("expected unknown-source error, got: %v", err)
+	}
+}
+
+// realQuackSource for the PushDownToRemote positive path. fakeSource cannot
+// satisfy the `*duckdbquack.Source` type assertion the Initialize check
+// performs, so the test constructs a zero-value Source directly. None of
+// the Source's methods are actually invoked during Initialize.
+func realQuackSource(t *testing.T) *duckdbquack.Source {
+	t.Helper()
+	return &duckdbquack.Source{
+		Config: duckdbquack.Config{
+			Name:        "s",
+			Type:        duckdbquack.SourceType,
+			URI:         "quack:host:9494",
+			Token:       "test-token-123",
+			DisableSSL:  true,
+			AttachAlias: "remote",
+		},
+		Db: nil, // never reached at Initialize time
+	}
+}
+
+func TestInitialize_PushDownToRemote_Accepted(t *testing.T) {
+	src := realQuackSource(t)
+	cfg := Config{
+		Name:             "current_prices",
+		Type:             "duckdb-sql",
+		Source:           "s",
+		Description:      "d",
+		Statement:        "SELECT p.name, h.unit_price FROM products p LEFT JOIN product_price_history h ON h.product_name = p.name",
+		PushDownToRemote: true,
+	}
+	tool, err := cfg.Initialize(map[string]sources.Source{"s": src})
+	if err != nil {
+		t.Fatalf("expected accept, got: %v", err)
+	}
+	if tool == nil {
+		t.Fatalf("expected non-nil Tool")
+	}
+	got, ok := tool.(Tool)
+	if !ok {
+		t.Fatalf("Initialize returned %T, want Tool", tool)
+	}
+	if !got.PushDownToRemote {
+		t.Errorf("PushDownToRemote not preserved on Tool")
+	}
+}
+
+func TestInitialize_PushDownToRemote_RejectsBoundParameters(t *testing.T) {
+	src := realQuackSource(t)
+	cfg := Config{
+		Name:             "needs_params",
+		Type:             "duckdb-sql",
+		Source:           "s",
+		Description:      "d",
+		Statement:        "SELECT * FROM products WHERE name ILIKE '%' || ? || '%'",
+		PushDownToRemote: true,
+		Parameters: parameters.Parameters{
+			parameters.NewStringParameter("name_pattern", "case-insensitive substring"),
+		},
+	}
+	_, err := cfg.Initialize(map[string]sources.Source{"s": src})
+	if err == nil {
+		t.Fatalf("expected reject, got accept")
+	}
+	for _, want := range []string{
+		"push_down_to_remote",
+		"bound `parameters:`",
+		"templateParameters",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing substring %q", err.Error(), want)
+		}
+	}
+}
+
+func TestInitialize_PushDownToRemote_RejectsNonQuackSource(t *testing.T) {
+	// fakeSource satisfies CompatibleSource but is not a *duckdbquack.Source,
+	// so the push_down_to_remote precheck must reject it.
+	src := &fakeSource{}
+	cfg := Config{
+		Name:             "elsewhere",
+		Type:             "duckdb-sql",
+		Source:           "s",
+		Description:      "d",
+		Statement:        "SELECT 1",
+		PushDownToRemote: true,
+	}
+	_, err := cfg.Initialize(map[string]sources.Source{"s": src})
+	if err == nil {
+		t.Fatalf("expected reject, got accept")
+	}
+	if !strings.Contains(err.Error(), "push_down_to_remote is only supported when the source is a duckdb-quack source") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

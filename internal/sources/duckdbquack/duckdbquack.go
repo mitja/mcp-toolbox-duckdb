@@ -555,6 +555,7 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opt
 
 	res, err := s.executeQuery(ctx, s.Db, statement, params, opts)
 	if err == nil || !needsReAttach(err, s.allAliases()...) {
+		err = wrapKnownErrors(err)
 		recordOutcome(ctx, span, baseAttrs, res, err, time.Since(start))
 		return res, err
 	}
@@ -576,6 +577,7 @@ func (s *Source) RunSQL(ctx context.Context, statement string, params []any, opt
 		return nil, wrapped
 	}
 	res, err = s.executeQuery(ctx, conn, statement, params, opts)
+	err = wrapKnownErrors(err)
 	recordOutcome(ctx, span, baseAttrs, res, err, time.Since(start))
 	return res, err
 }
@@ -643,6 +645,44 @@ func (s *Source) executeQuery(ctx context.Context, q quackQuerier, statement str
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
 	return &QueryResult{Columns: columns, Rows: out, Truncated: truncated}, nil
+}
+
+// streamingScanErrorPattern is the substring DuckDB raises when a single
+// physical plan contains more than one streaming-scan source — for our
+// purposes, two or more references to ATTACHed Quack tables in the same
+// query. Detected so wrapKnownErrors can translate the cryptic engine
+// message into a pointer at the `push_down_to_remote` flag (single-source
+// case) or the manual quack_query() wrapper (multi-source case).
+const streamingScanErrorPattern = "Multiple streaming scans or streaming scans"
+
+// wrapKnownErrors translates known low-level DuckDB / Quack errors into
+// messages that tell the developer where the fix lives. The original
+// error is preserved via %w so errors.Is / Unwrap still work for callers
+// that want to match on it.
+//
+// Today this only handles the streaming-scan limitation; add more cases
+// here as we discover them.
+func wrapKnownErrors(err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), streamingScanErrorPattern) {
+		return fmt.Errorf(
+			"this query references two or more streaming scans in one plan "+
+				"(typically two ATTACHed Quack tables joined in one statement), "+
+				"which DuckDB does not yet support. "+
+				"If the tool targets a single duckdb-quack source, set "+
+				"`push_down_to_remote: true` on the tool — the whole SQL "+
+				"will execute on the remote via quack_query() and only the "+
+				"result rows stream back. "+
+				"For a multi-attach (cross-source) tool, wrap the inner SQL "+
+				"in quack_query('<primary-uri>', '<sql>', disable_ssl := …) "+
+				"manually so the join executes on one remote. "+
+				"Original error: %w",
+			err,
+		)
+	}
+	return err
 }
 
 // needsReAttach decides whether an error from a user query suggests the

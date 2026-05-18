@@ -66,6 +66,21 @@ type Config struct {
 	TemplateParameters parameters.Parameters  `yaml:"templateParameters"`
 	Annotations        *tools.ToolAnnotations `yaml:"annotations,omitempty"`
 	ScopesRequired     []string               `yaml:"scopesRequired"`
+
+	// PushDownToRemote, when true, ships the entire statement to the
+	// remote Quack server via the quack_query() table function instead of
+	// executing it against the locally ATTACHed catalogs. The join (and
+	// every other operator) runs on the remote DuckDB next to the data;
+	// only the result rows stream back as one scan.
+	//
+	// Use when a tool's SQL references two or more attached tables and
+	// DuckDB would otherwise fail with "Multiple streaming scans … not
+	// currently supported". Only available for tools whose source is a
+	// duckdb-quack source. Incompatible with bound `parameters:` because
+	// quack_query() takes the inner SQL as a string literal and DuckDB
+	// does not bind `?` markers inside string literals; template
+	// parameters (substituted before the wrap) remain supported.
+	PushDownToRemote bool `yaml:"push_down_to_remote"`
 }
 
 var _ tools.ToolConfig = Config{}
@@ -82,6 +97,15 @@ func (cfg Config) Initialize(srcs map[string]sources.Source) (tools.Tool, error)
 	src, ok := rawSrc.(duckdbmeta.CompatibleSource)
 	if !ok {
 		return nil, fmt.Errorf("tool %q: source %q (type %q) is not compatible with %s", cfg.Name, cfg.Source, rawSrc.SourceType(), resourceType)
+	}
+
+	if cfg.PushDownToRemote {
+		if _, ok := rawSrc.(*duckdbquack.Source); !ok {
+			return nil, fmt.Errorf("tool %q: push_down_to_remote is only supported when the source is a duckdb-quack source (source %q has type %q)", cfg.Name, cfg.Source, rawSrc.SourceType())
+		}
+		if len(cfg.Parameters) > 0 {
+			return nil, fmt.Errorf("tool %q: push_down_to_remote cannot be combined with bound `parameters:` — quack_query() takes the inner SQL as a string literal and DuckDB does not bind `?` markers inside it. Use templateParameters (substituted before the push-down wrap) or remove push_down_to_remote and wrap quack_query(...) manually in the statement", cfg.Name)
+		}
 	}
 
 	policy := src.EffectivePolicy()
@@ -134,6 +158,14 @@ func (t Tool) Invoke(ctx context.Context, resourceMgr tools.SourceProvider, para
 	}
 
 	resp, runErr := duckdbmeta.Invoke(ctx, source, t.Source, t.statementHash, func(ctx context.Context, opts duckdbquack.QueryOptions) (*duckdbquack.QueryResult, error) {
+		if t.PushDownToRemote {
+			// Initialize already rejected bound parameters when this
+			// flag is set, so newParams is empty here. The wrap +
+			// instrumentation lives inside QuackQuery; the resulting
+			// duckdb.query span and reattach path are identical to
+			// the RunSQL path.
+			return source.QuackQuery(ctx, newStatement, opts)
+		}
 		return source.RunSQL(ctx, newStatement, newParams.AsSlice(), opts)
 	})
 	if runErr != nil {

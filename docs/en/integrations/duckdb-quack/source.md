@@ -294,3 +294,15 @@ section with concrete do/don't examples (project narrowly, filter
 early, prefer single-source aggregates, always set `LIMIT` for
 top-N tools) — they apply uniformly to `duckdb-sql` tools regardless
 of how many attachments a source has.
+
+
+### Federating other data behind the remote Quack
+
+Because the remote behind a `duckdb-quack` source is itself a DuckDB
+instance, anything DuckDB can read can be exposed as a view in `main`
+and reached through the existing `ATTACH` from the Toolbox side — no
+adapter changes. Parquet, CSV, the DuckDB Postgres / MySQL / SQLite
+scanners, and Iceberg/Delta extensions all work this way. The remote
+does the read; the Toolbox-side in-process DuckDB just sees a normal
+view via the attached alias. The demo repo's "Parquet behind a
+remote Quack" section walks through a working `read_parquet` example.

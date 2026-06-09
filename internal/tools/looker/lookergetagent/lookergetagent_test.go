@@ -15,6 +15,7 @@
 package lookergetagent_test
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -50,11 +51,13 @@ func TestParseFromYaml(t *testing.T) {
                                 `,
 			want: server.ToolConfigs{
 				"test_tool": lkr.Config{
-					Name:         "test_tool",
-					Type:         "looker-get-agent",
-					Source:       "my-instance",
-					Description:  "some description",
-					AuthRequired: []string{},
+					ConfigBase: tools.ConfigBase{
+						Name:         "test_tool",
+						Description:  "some description",
+						AuthRequired: []string{},
+					},
+					Type:   "looker-get-agent",
+					Source: "my-instance",
 				},
 			},
 		},
@@ -125,7 +128,7 @@ func (m MockSource) LookerApiSettings() *rtl.ApiSettings {
 	return &rtl.ApiSettings{}
 }
 
-func (m MockSource) GetLookerSDK(string) (*v4.LookerSDK, error) {
+func (m MockSource) GetLookerSDK(ctx context.Context, s string) (*v4.LookerSDK, error) {
 	return &v4.LookerSDK{}, nil
 }
 
@@ -145,10 +148,12 @@ func TestInvokeValidation(t *testing.T) {
 	}
 
 	cfg := lkr.Config{
-		Name:        "test_tool",
-		Type:        "looker-get-agent",
-		Source:      "my-instance",
-		Description: "test description",
+		ConfigBase: tools.ConfigBase{
+			Name:        "test_tool",
+			Description: "test description",
+		},
+		Type:   "looker-get-agent",
+		Source: "my-instance",
 	}
 
 	tool, err := cfg.Initialize(nil)
@@ -186,10 +191,12 @@ func TestInvokeValidation(t *testing.T) {
 
 func TestManifest(t *testing.T) {
 	cfg := lkr.Config{
-		Name:        "test_tool",
-		Type:        "looker-get-agent",
-		Source:      "my-instance",
-		Description: "test description",
+		ConfigBase: tools.ConfigBase{
+			Name:        "test_tool",
+			Description: "test description",
+		},
+		Type:   "looker-get-agent",
+		Source: "my-instance",
 	}
 
 	tool, err := cfg.Initialize(nil)
@@ -220,10 +227,12 @@ func TestManifest(t *testing.T) {
 func TestAnnotations(t *testing.T) {
 	readOnlyFalse := false
 	cfg := lkr.Config{
-		Name:        "test_tool",
-		Type:        "looker-get-agent",
-		Source:      "my-instance",
-		Description: "test description",
+		ConfigBase: tools.ConfigBase{
+			Name:        "test_tool",
+			Description: "test description",
+		},
+		Type:   "looker-get-agent",
+		Source: "my-instance",
 		Annotations: &tools.ToolAnnotations{
 			ReadOnlyHint: &readOnlyFalse,
 		},

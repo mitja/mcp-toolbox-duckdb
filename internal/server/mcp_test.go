@@ -31,6 +31,10 @@ import (
 	"github.com/googleapis/mcp-toolbox/internal/server/mcp/jsonrpc"
 	"github.com/googleapis/mcp-toolbox/internal/server/resources"
 	"github.com/googleapis/mcp-toolbox/internal/telemetry"
+	"github.com/googleapis/mcp-toolbox/internal/util"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/googleapis/mcp-toolbox/internal/testutils"
 )
@@ -78,9 +82,9 @@ var prompt2Args = []any{
 }
 
 func TestMcpEndpointWithoutInitialized(t *testing.T) {
-	mockTools := []testutils.MockTool{tool1, tool2, tool3, tool4, tool5}
-	mockPrompts := []testutils.MockPrompt{prompt1, prompt2}
-	toolsMap, toolsets, promptsMap, promptsets := setUpResources(t, mockTools, mockPrompts)
+	mockTools := []testutils.MockTool{testutils.MockTool1, testutils.MockTool2, testutils.MockTool3, testutils.MockTool4, testutils.MockTool5}
+	mockPrompts := []testutils.MockPrompt{testutils.MockPrompt1, testutils.MockPrompt2}
+	toolsMap, toolsets, promptsMap, promptsets := testutils.SetUpResources(t, mockTools, mockPrompts)
 	r, shutdown := setUpServer(t, "mcp", toolsMap, toolsets, promptsMap, promptsets)
 	defer shutdown()
 	ts := runServer(r, false)
@@ -423,9 +427,9 @@ func runInitializeLifecycle(t *testing.T, ts *httptest.Server, protocolVersion s
 }
 
 func TestMcpEndpoint(t *testing.T) {
-	mockTools := []testutils.MockTool{tool1, tool2, tool3, tool4, tool5}
-	mockPrompts := []testutils.MockPrompt{prompt1, prompt2}
-	toolsMap, toolsets, promptsMap, promptsets := setUpResources(t, mockTools, mockPrompts)
+	mockTools := []testutils.MockTool{testutils.MockTool1, testutils.MockTool2, testutils.MockTool3, testutils.MockTool4, testutils.MockTool5}
+	mockPrompts := []testutils.MockPrompt{testutils.MockPrompt1, testutils.MockPrompt2}
+	toolsMap, toolsets, promptsMap, promptsets := testutils.SetUpResources(t, mockTools, mockPrompts)
 	r, shutdown := setUpServer(t, "mcp", toolsMap, toolsets, promptsMap, promptsets)
 	defer shutdown()
 	ts := runServer(r, false)
@@ -450,7 +454,7 @@ func TestMcpEndpoint(t *testing.T) {
 						"tools":   map[string]any{"listChanged": false},
 						"prompts": map[string]any{"listChanged": false},
 					},
-					"serverInfo": map[string]any{"name": serverName, "version": fakeVersionString},
+					"serverInfo": map[string]any{"name": serverName, "version": testutils.MockVersionString},
 				},
 			},
 		},
@@ -467,7 +471,7 @@ func TestMcpEndpoint(t *testing.T) {
 						"tools":   map[string]any{"listChanged": false},
 						"prompts": map[string]any{"listChanged": false},
 					},
-					"serverInfo": map[string]any{"name": serverName, "version": fakeVersionString},
+					"serverInfo": map[string]any{"name": serverName, "version": testutils.MockVersionString},
 				},
 			},
 		},
@@ -484,7 +488,7 @@ func TestMcpEndpoint(t *testing.T) {
 						"tools":   map[string]any{"listChanged": false},
 						"prompts": map[string]any{"listChanged": false},
 					},
-					"serverInfo": map[string]any{"name": serverName, "version": fakeVersionString},
+					"serverInfo": map[string]any{"name": serverName, "version": testutils.MockVersionString},
 				},
 			},
 		},
@@ -501,7 +505,7 @@ func TestMcpEndpoint(t *testing.T) {
 						"tools":   map[string]any{"listChanged": false},
 						"prompts": map[string]any{"listChanged": false},
 					},
-					"serverInfo": map[string]any{"name": serverName, "version": fakeVersionString},
+					"serverInfo": map[string]any{"name": serverName, "version": testutils.MockVersionString},
 				},
 			},
 		},
@@ -784,6 +788,7 @@ func TestMcpEndpoint(t *testing.T) {
 					wantStatusCode: http.StatusOK,
 					want: map[string]any{
 						"jsonrpc": "2.0",
+						"id":      nil,
 						"error": map[string]any{
 							"code":    -32600.0,
 							"message": "not supporting batch requests",
@@ -894,10 +899,6 @@ func TestMcpEndpoint(t *testing.T) {
 						var got map[string]any
 						if err := json.Unmarshal(body, &got); err != nil {
 							t.Fatalf("unexpected error unmarshalling body: %s", err)
-						}
-						// for decode failure, a random uuid is generated in server
-						if tc.want["id"] == nil {
-							tc.want["id"] = got["id"]
 						}
 						if !reflect.DeepEqual(got, tc.want) {
 							t.Fatalf("unexpected response: got %+v, want %+v", got, tc.want)
@@ -1090,9 +1091,9 @@ func TestStdioSession(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	mockTools := []testutils.MockTool{tool1, tool2, tool3}
-	mockPrompts := []testutils.MockPrompt{prompt1, prompt2}
-	toolsMap, toolsets, promptsMap, promptsets := setUpResources(t, mockTools, mockPrompts)
+	mockTools := []testutils.MockTool{testutils.MockTool1, testutils.MockTool2, testutils.MockTool3}
+	mockPrompts := []testutils.MockPrompt{testutils.MockPrompt1, testutils.MockPrompt2}
+	toolsMap, toolsets, promptsMap, promptsets := testutils.SetUpResources(t, mockTools, mockPrompts)
 
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -1104,7 +1105,7 @@ func TestStdioSession(t *testing.T) {
 		t.Fatalf("unable to initialize logger: %s", err)
 	}
 
-	otelShutdown, err := telemetry.SetupOTel(ctx, fakeVersionString, "", false, "toolbox")
+	otelShutdown, err := telemetry.SetupOTel(ctx, testutils.MockVersionString, "", false, "", "toolbox")
 	if err != nil {
 		t.Fatalf("unable to setup otel: %s", err)
 	}
@@ -1115,7 +1116,7 @@ func TestStdioSession(t *testing.T) {
 		}
 	}()
 
-	instrumentation, err := telemetry.CreateTelemetryInstrumentation(fakeVersionString)
+	instrumentation, err := telemetry.CreateTelemetryInstrumentation(testutils.MockVersionString)
 	if err != nil {
 		t.Fatalf("unable to create custom metrics: %s", err)
 	}
@@ -1125,7 +1126,7 @@ func TestStdioSession(t *testing.T) {
 	resourceManager := resources.NewResourceManager(nil, nil, nil, toolsMap, toolsets, promptsMap, promptsets)
 
 	server := &Server{
-		version:         fakeVersionString,
+		version:         testutils.MockVersionString,
 		logger:          testLogger,
 		instrumentation: instrumentation,
 		sseManager:      sseManager,
@@ -1196,5 +1197,88 @@ func TestSseManagerGetNilSessionValue(t *testing.T) {
 	}
 	if session != nil {
 		t.Error("expected nil session for nil session value")
+	}
+}
+
+// withTraceContextPropagator registers the W3C trace-context propagator globally
+// for the duration of the test. extractMeta delegates to otel.GetTextMapPropagator,
+// and the default global propagator is a no-op — so without this helper the
+// "extracted" trace context would always be invalid.
+func withTraceContextPropagator(t *testing.T) {
+	t.Helper()
+	prev := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
+}
+
+func TestExtractMeta_EmptyOrInvalidBody(t *testing.T) {
+	cases := map[string][]byte{
+		"empty":      []byte(""),
+		"not json":   []byte("not json"),
+		"no _meta":   []byte(`{"params":{}}`),
+		"no params":  []byte(`{"method":"tools/call"}`),
+		"empty meta": []byte(`{"params":{"_meta":{}}}`),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := extractMeta(context.Background(), body)
+			if util.TelemetryAttributesFromContext(ctx) != nil {
+				t.Error("expected no telemetry attributes")
+			}
+		})
+	}
+}
+
+func TestExtractMeta_TraceparentOnly(t *testing.T) {
+	withTraceContextPropagator(t)
+	body := []byte(`{"params":{"_meta":{"traceparent":"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"}}}`)
+	ctx := extractMeta(context.Background(), body)
+
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		t.Fatal("expected valid span context from extracted traceparent")
+	}
+	if got := sc.TraceID().String(); got != "0af7651916cd43dd8448eb211c80319c" {
+		t.Errorf("trace id mismatch: got %s", got)
+	}
+	if util.TelemetryAttributesFromContext(ctx) != nil {
+		t.Error("expected no telemetry attributes when only traceparent is sent")
+	}
+}
+
+func TestExtractMeta_TelemetryAttrsOnly(t *testing.T) {
+	body := []byte(`{"params":{"_meta":{"dev.mcp-toolbox/telemetry":{` +
+		`"client.name":"toolbox-langchain-python",` +
+		`"client.version":"v0.1.0",` +
+		`"client.model":"gemini-2.5-flash",` +
+		`"client.user.id":"user-123",` +
+		`"client.agent.id":"agent-456"}}}}`)
+
+	ta := util.TelemetryAttributesFromContext(extractMeta(context.Background(), body))
+	if ta == nil {
+		t.Fatal("expected TelemetryAttributes in context")
+	}
+	want := util.TelemetryAttributes{
+		ClientName: "toolbox-langchain-python", ClientVersion: "v0.1.0",
+		ClientModel: "gemini-2.5-flash", ClientUserID: "user-123", ClientAgentID: "agent-456",
+	}
+	if *ta != want {
+		t.Errorf("got %+v, want %+v", *ta, want)
+	}
+}
+
+func TestExtractMeta_TraceparentAndTelemetryBoth(t *testing.T) {
+	withTraceContextPropagator(t)
+	body := []byte(`{"params":{"_meta":{` +
+		`"traceparent":"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",` +
+		`"dev.mcp-toolbox/telemetry":{"client.name":"foo","client.version":"v1"}}}}`)
+	ctx := extractMeta(context.Background(), body)
+
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		t.Error("expected valid span context")
+	}
+	ta := util.TelemetryAttributesFromContext(ctx)
+	if ta == nil || ta.ClientName != "foo" || ta.ClientVersion != "v1" {
+		t.Errorf("expected telemetry attrs alongside traceparent, got %+v", ta)
 	}
 }

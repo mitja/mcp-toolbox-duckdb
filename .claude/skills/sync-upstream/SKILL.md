@@ -14,6 +14,25 @@ and never commit directly to local `main`.
 Follow these steps in order. Stop and ask the user if anything other than the
 known `go.mod`/`go.sum` conflict appears.
 
+## 0. Sync with origin first (avoid the double upstream-merge)
+
+The remote `origin/feat/duckdb-quack` also receives upstream changes by a second
+path — GitHub's "Sync fork" button (or work from another machine) merges
+`origin/main` into it. If you merge `upstream/main` locally without first pulling
+`origin`, the two upstream-merge paths diverge and the later push is rejected as
+non-fast-forward. So always integrate origin **before** touching upstream:
+
+```bash
+git checkout feat/duckdb-quack
+git fetch origin
+git log --oneline feat/duckdb-quack..origin/feat/duckdb-quack   # what origin has that we don't
+git merge origin/feat/duckdb-quack                              # fast-forward or clean merge
+```
+
+If this pulled in upstream merges that origin already did, the later
+`upstream/main` merge (step 3) may be a no-op or much smaller — that's expected.
+Resolve any `go.mod`/`go.sum` conflict here the same way as step 4.
+
 ## 1. Make sure the upstream remote exists, then fetch
 
 ```bash

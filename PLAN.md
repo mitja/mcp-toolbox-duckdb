@@ -114,7 +114,7 @@ End-to-end JSON response verified through the full Compose stack:
 1. `quack_serve` named-argument syntax is `:=`, not `=>` (spec §6.2 wrong).
 2. `CREATE SECRET (TYPE quack, …)` accepts **only** `TOKEN`. `DISABLE_SSL` belongs on `ATTACH`. Spec §5.2 implied otherwise.
 3. The Quack URI parser has a quirk: hostnames matching the scheme keyword (e.g., a docker service literally named `quack`) collide and parse as `host=<port>, port=<port>`. Workaround: rename the service. Worth filing upstream.
-4. `quack_authorization_function` must be activated **after** the expected clients have ATTACHed. Earlier activation rejects ATTACH's own catalog probe queries. The demo's `init.sql.tmpl` creates the macro but leaves activation to a documented post-startup `docker exec` step.
+4. ~~`quack_authorization_function` must be activated after the clients have ATTACHed.~~ Corrected 2026-10-25: the callback returns the query to run (`VARCHAR`), not a boolean. The boolean macro refused every request, ATTACH included, and that was misread as "ATTACH's catalog probes are rejected". A persistent macro that returns the query (or NULL to refuse) works when activated before any client connects. See the source docs.
 5. `FROM` is not a valid leading statement kind. Spec §5.2 listed it in `allowed_statement_kinds`; the implementation drops it.
 6. The upstream Toolbox `Dockerfile` cross-compiles via Zig, whose `lld` linker cannot resolve C++ stdlib symbols (`typeinfo for std::ostream`, etc.) that the DuckDB-Go static library requires. The demo uses an inline `dockerfile_inline:` that does a native CGO compile with `golang:1-bookworm` (matching `distroless/cc-debian12` for glibc) plus `g++` for libstdc++. The fork's upstream Dockerfile is untouched.
 
@@ -163,7 +163,7 @@ Status as of 2026-05-15:
 
 - **Upstream bug filings (do NOT auto-file, see `CLAUDE.local.md`).** Two writeups are already paste-ready in `mcp-toolbox-duckdb-demo/NOTES.md`:
   1. Quack URI parser confuses hostname `quack` with the scheme keyword.
-  2. `quack_authorization_function` rejects ATTACH's own internal catalog probes, making it impossible to enable authz before clients have attached.
+  2. ~~`quack_authorization_function` rejects ATTACH's own internal catalog probes.~~ Not a bug: the callback must return the query (VARCHAR). Do not file.
 - **`golangci-lint run --fix`.** Not installed on the dev machine; will run in CI on PR. Worth doing locally before the upstream PR (Phase 5).
 
 ---

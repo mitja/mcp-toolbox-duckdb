@@ -69,12 +69,9 @@ func startInProcessQuackServer(t *testing.T) *quackServer {
 	defer cancel()
 
 	// Seed data and start the Quack server with default authentication
-	// (client TOKEN must equal the bootstrap token). The read-only
-	// authorization macro is created here but NOT activated yet: setting
-	// quack_authorization_function before any client ATTACH causes ATTACH's
-	// internal catalog queries to be rejected. Tests that need
-	// authorization enforcement call enableReadOnlyAuthz() after the
-	// client is attached.
+	// (client TOKEN must equal the bootstrap token) and the read-only
+	// authorization callback switched on before any client connects, as a
+	// deployment would run it. See readOnlyMacro.
 	stmts := []string{
 		"INSTALL quack FROM core_nightly",
 		"LOAD quack",
@@ -91,9 +88,8 @@ func startInProcessQuackServer(t *testing.T) *quackServer {
 			(4, 'Carol AG',    750.00, DATE '2026-03-10'),
 			(5, 'Alice GmbH',  120.00, DATE '2026-04-02'),
 			(6, 'Daniel SARL', 980.00, DATE '2026-04-15')`,
-		`CREATE OR REPLACE MACRO read_only(sid, query) AS (
-			regexp_matches(upper(trim(query)), '^(SELECT|WITH|EXPLAIN|DESCRIBE|SHOW)\b')
-		)`,
+		readOnlyMacro,
+		"SET GLOBAL quack_authorization_function = 'read_only'",
 		fmt.Sprintf(
 			"CALL quack_serve('quack:127.0.0.1:%d', token := '%s', allow_other_hostname := true, disable_ssl := true)",
 			port, token,
@@ -119,6 +115,23 @@ func startInProcessQuackServer(t *testing.T) *quackServer {
 	}
 	return srv
 }
+
+// readOnlyMacro is the server's authorization callback. Quack calls it with
+// the session id and the query text and runs what it RETURNS (VARCHAR); NULL
+// refuses the query ("Authorization failed"). A boolean-returning macro
+// therefore refuses every request, ATTACH included. The macro must be
+// persistent: a TEMP macro is not visible to the server's connections. It
+// lets a query through only when DuckDB's parser finds exactly one SELECT
+// (json_serialize_sql serializes nothing else; DESCRIBE and SHOW parse as
+// one) that reads no file. ATTACH's catalog probes are ordinary SELECTs that
+// start with a newline, so they pass.
+const readOnlyMacro = `CREATE OR REPLACE MACRO read_only(sid, query) AS (
+	CASE WHEN coalesce(NOT (json_serialize_sql(query::VARCHAR)->>'error')::BOOLEAN, false)
+	      AND json_array_length(json_serialize_sql(query::VARCHAR)->'statements') = 1
+	      AND NOT regexp_matches(json_serialize_sql(query::VARCHAR)::VARCHAR,
+	            '"function_name":"(read_[a-z_]*|[a-z_]*_scan|glob|sniff_csv|parquet_[a-z_]*|duckdb_secrets|duckdb_settings|which_secret|getenv)"|"table_name":"[^"]*[/\\.:]')
+	     THEN query END
+)`
 
 // freeTCPPort returns a port that was free at the moment of the call. There
 // is an inherent race with anything else binding the same port before the
@@ -312,21 +325,6 @@ func TestTimeoutCancels(t *testing.T) {
 	}
 }
 
-// enableReadOnlyAuthz activates the read_only authorization macro on the
-// server side. Must be called AFTER the client has ATTACHed — installing
-// authz earlier breaks ATTACH's internal catalog queries.
-func enableReadOnlyAuthz(t *testing.T, srv *quackServer) {
-	t.Helper()
-	if _, err := srv.db.ExecContext(context.Background(),
-		"SET GLOBAL quack_authorization_function = 'read_only'"); err != nil {
-		t.Fatalf("enable read_only authz: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = srv.db.ExecContext(context.Background(),
-			"RESET GLOBAL quack_authorization_function")
-	})
-}
-
 // TestDecimalRenderedAsString proves that DECIMAL cell values come back as
 // strings in the QueryResult (spec §7 type rules: preserve precision).
 func TestDecimalRenderedAsString(t *testing.T) {
@@ -481,17 +479,46 @@ func TestReAttach_DoesNotMaskUnrelatedErrors(t *testing.T) {
 // macro on the Quack server is the real boundary: even when a destructive
 // statement is issued directly through the underlying *sql.DB (bypassing the
 // duckdb-sql tool's config-load validation), the server refuses it.
-func TestServerSideAuthz_RejectsInsert(t *testing.T) {
+func TestServerSideAuthz_RefusesWritesAndFileReads(t *testing.T) {
 	srv := startInProcessQuackServer(t)
 	src := newSource(t, srv, duckdbquack.Policy{})
-	enableReadOnlyAuthz(t, srv)
+	db := src.DuckDBQuackDB()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, err := src.DuckDBQuackDB().ExecContext(ctx,
-		"INSERT INTO remote.sales VALUES (99, 'X', 1.00, DATE '2026-05-01')")
-	if err == nil {
-		t.Fatalf("expected server-side authorization rejection, got nil")
+	// The ATTACH above went through with the callback on; reads work.
+	var n int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM remote.sales").Scan(&n); err != nil || n != 6 {
+		t.Fatalf("SELECT through the ATTACH with authorization on: n=%d err=%v", n, err)
+	}
+	// quack_query sends the text as it is, past the client's own checks:
+	// only the server's callback stands between it and the data.
+	remote := func(q string) error {
+		_, err := db.ExecContext(ctx, fmt.Sprintf(
+			"SELECT * FROM quack_query('%s', '%s', disable_ssl := true)", srv.uri, strings.ReplaceAll(q, "'", "''")))
+		return err
+	}
+	if err := remote("SELECT count(*) FROM sales"); err != nil {
+		t.Fatalf("a read through quack_query should pass: %v", err)
+	}
+	for _, q := range []string{
+		"DELETE FROM sales",
+		"UPDATE sales SET amount = 0",
+		"INSERT INTO sales VALUES (99, 'X', 1.00, DATE '2026-05-01')",
+		"DROP TABLE sales",
+		"CREATE TABLE x AS SELECT 1",
+		"SELECT 1; DELETE FROM sales",
+		"COPY sales TO '/tmp/x.csv'",
+		"SELECT count(*) FROM read_csv('/etc/hosts')",
+		"SELECT count(*) FROM '/etc/hosts'",
+		"SELECT getenv('HOME')",
+	} {
+		if err := remote(q); err == nil || !strings.Contains(err.Error(), "Authorization failed") {
+			t.Errorf("%q: want the server's refusal (Authorization failed), got %v", q, err)
+		}
+	}
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM remote.sales").Scan(&n); err != nil || n != 6 {
+		t.Fatalf("rows after the refused writes: n=%d err=%v", n, err)
 	}
 }

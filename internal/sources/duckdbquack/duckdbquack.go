@@ -130,6 +130,17 @@ type Policy struct {
 	// Timeout is the per-invocation context deadline applied by the
 	// tool layer. 0 means "use the default" (30s).
 	Timeout time.Duration `yaml:"timeout"`
+
+	// AllowLocalFiles keeps the client-side DuckDB's local filesystem
+	// enabled. By default (false) the source runs
+	// `SET disabled_filesystems = 'LocalFileSystem'` once Quack is loaded
+	// and the remotes are attached, so no statement — curated or
+	// agent-supplied — can read files of the Toolbox's host or container
+	// (read_csv('/etc/passwd'), FROM '/path', COPY ... TO). Remote
+	// catalogs, quack_query and later re-ATTACHes keep working. Only an
+	// in-memory client database (client_database ":memory:", the default)
+	// is locked down; a file-backed client database needs its filesystem.
+	AllowLocalFiles bool `yaml:"allow_local_files"`
 }
 
 // Attachment describes one additional Quack ATTACH within a single
@@ -141,8 +152,9 @@ type Policy struct {
 //
 // Each additional attachment gets its own SCOPED CREATE SECRET (TYPE
 // quack, TOKEN '…', SCOPE 'quack:host:port') so DuckDB's secret resolver
-// picks the right token per URI. The primary attachment's secret remains
-// un-scoped for backward compatibility with single-source configs.
+// picks the right token per URI. The primary attachment's secret is scoped
+// to its URI as well: an un-scoped secret is offered to every quack: host,
+// so quack_query('quack:any-host:9494', ...) would send the token there.
 //
 // Token and DisableSSL on an Attachment are optional and inherit from
 // the source's primary values when empty / unset.
@@ -349,10 +361,31 @@ func initClient(ctx context.Context, tracer trace.Tracer, cfg Config) (*sql.DB, 
 		}
 	}
 
+	if err := lockLocalFiles(ctx, db, cfg); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+
 	return db, nil
 }
 
-// createQuackSecret creates a DuckDB SECRET of TYPE quack carrying the token.
+// lockLocalFiles disables the client DuckDB's local filesystem unless the
+// policy allows local files or the client database is file-backed (see
+// Policy.AllowLocalFiles). It runs after INSTALL/LOAD of Quack, which need
+// the extension directory; ATTACH and quack_query go over the network and
+// keep working.
+func lockLocalFiles(ctx context.Context, db *sql.DB, cfg Config) error {
+	if cfg.Policy.AllowLocalFiles || cfg.ClientDatabase != defaultClientDatabase {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, "SET disabled_filesystems = 'LocalFileSystem'"); err != nil {
+		return fmt.Errorf("disable the local filesystem (policy.allow_local_files: false): %w", err)
+	}
+	return nil
+}
+
+// createQuackSecret creates a DuckDB SECRET of TYPE quack carrying the token,
+// SCOPEd to the source's URI so DuckDB offers it to that server only.
 // The Quack SECRET schema only accepts TOKEN; TLS preference lives on the
 // ATTACH statement instead (see attachRemote). The secret name is scoped to
 // the source name to permit multiple duckdb-quack sources within the same
@@ -364,8 +397,8 @@ func initClient(ctx context.Context, tracer trace.Tracer, cfg Config) (*sql.DB, 
 func createQuackSecret(ctx context.Context, db *sql.DB, cfg Config) error {
 	secretName := "toolbox_" + sanitizeIdentifier(cfg.Name)
 	stmt := fmt.Sprintf(
-		"CREATE SECRET %s (TYPE quack, TOKEN '%s')",
-		secretName, cfg.Token,
+		"CREATE SECRET %s (TYPE quack, TOKEN '%s', SCOPE '%s')",
+		secretName, cfg.Token, strings.ReplaceAll(cfg.URI, "'", "''"),
 	)
 	if _, err := db.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("CREATE SECRET for source %q: %w", cfg.Name, err)
@@ -771,13 +804,13 @@ func (s *Source) reAttachOnConn(ctx context.Context, conn *sql.Conn) error {
 	}
 	useSecret := s.Quack.UseSecret != nil && *s.Quack.UseSecret
 
-	// Primary: un-scoped secret (matches the init-time behavior) +
+	// Primary: secret scoped to its URI (matches the init-time behavior) +
 	// best-effort DETACH + ATTACH.
 	if useSecret {
 		secretName := "toolbox_" + sanitizeIdentifier(s.Name)
 		stmt := fmt.Sprintf(
-			"CREATE OR REPLACE SECRET %s (TYPE quack, TOKEN '%s')",
-			secretName, s.Token,
+			"CREATE OR REPLACE SECRET %s (TYPE quack, TOKEN '%s', SCOPE '%s')",
+			secretName, s.Token, strings.ReplaceAll(s.URI, "'", "''"),
 		)
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("CREATE OR REPLACE SECRET (primary): %w", err)

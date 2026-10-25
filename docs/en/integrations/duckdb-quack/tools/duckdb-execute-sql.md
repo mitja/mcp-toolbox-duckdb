@@ -34,8 +34,10 @@ agent toolsets. tool=dev_duckdb_execute_sql source=sales-quack
 Validation runs **at every invocation** (not just config-load,
 since the SQL is dynamic): multi-statement bodies are rejected, the
 leading keyword must be in the allowlist, and the forbidden-token
-scan rejects DDL/DML verbs plus anything in
-`source.Policy.ForbiddenPatterns`. The validator is defense in depth;
+scan rejects DDL/DML verbs, `quack_query` and `quack_query_by_name`
+(paths to a Quack server around the source's `ATTACH`), plus anything in
+`source.Policy.ForbiddenPatterns`. The source's client DuckDB has no local
+filesystem unless `policy.allow_local_files` is set, so file readers fail. The validator is defense in depth;
 the server-side `quack_authorization_function` is the real boundary.
 
 ## Compatible Sources

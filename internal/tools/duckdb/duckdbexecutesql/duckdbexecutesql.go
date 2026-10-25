@@ -126,6 +126,13 @@ func (cfg Config) Initialize(srcs map[string]sources.Source) (tools.Tool, error)
 
 var _ tools.Tool = Tool{}
 
+// AgentSQLForbidden are tokens refused in agent-supplied SQL on top of the
+// built-in deny list and policy.forbidden_patterns. A curated duckdb-sql
+// statement may use quack_query (push_down_to_remote wraps statements in
+// it); SQL an agent writes must not: quack_query reaches any Quack server,
+// around the source's ATTACH and the host it names.
+var AgentSQLForbidden = []string{"QUACK_QUERY", "QUACK_QUERY_BY_NAME"}
+
 type Tool struct {
 	Config
 	Parameters parameters.Parameters `yaml:"parameters"`
@@ -148,7 +155,8 @@ func (t Tool) Invoke(ctx context.Context, mgr tools.SourceProvider, params param
 	if len(allowed) == 0 {
 		allowed = duckdbsql.DefaultAllowedStatementKinds
 	}
-	if err := duckdbsql.ValidateStatement(sql, allowed, policy.ForbiddenPatterns); err != nil {
+	forbidden := append(append([]string{}, AgentSQLForbidden...), policy.ForbiddenPatterns...)
+	if err := duckdbsql.ValidateStatement(sql, allowed, forbidden); err != nil {
 		// Pass nil as the Cause so AgentError.Error() does not append the
 		// underlying err's message again — it's already formatted into Msg.
 		return nil, util.NewAgentError(fmt.Sprintf("statement rejected by policy: %v", err), nil)

@@ -53,17 +53,32 @@ CALL quack_serve(
 );
 ```
 
-A read-only authorization callback is the real security boundary. Install
-it **after** clients have attached, because the macro is also evaluated for
-the internal catalog probes that `ATTACH` issues:
+A read-only authorization callback is the real security boundary. Switch it
+on **before** any client connects. Quack calls the callback with the session id
+and the query text and runs the query the callback **returns** (`VARCHAR`);
+`NULL` refuses it with `Authorization failed`. A macro that returns a boolean
+therefore refuses every request, `ATTACH` included, and a `TEMP` macro is not
+visible to the server's connections. The catalog probes an `ATTACH` sends are
+ordinary `SELECT`s that start with a newline. A first-keyword regex is not
+enough (`SELECT 1; DELETE FROM sales` passes it), so let DuckDB's parser
+decide: exactly one `SELECT` (`json_serialize_sql` serializes nothing else;
+`DESCRIBE` and `SHOW` parse as one) that reads no file:
 
 ```sql
 CREATE OR REPLACE MACRO read_only(sid, query) AS (
-  regexp_matches(upper(trim(query)),
-                 '^(SELECT|WITH|EXPLAIN|DESCRIBE|SHOW)\b')
+  CASE WHEN coalesce(NOT (json_serialize_sql(query::VARCHAR)->>'error')::BOOLEAN, false)
+        AND json_array_length(json_serialize_sql(query::VARCHAR)->'statements') = 1
+        AND NOT regexp_matches(json_serialize_sql(query::VARCHAR)::VARCHAR,
+              '"function_name":"(read_[a-z_]*|[a-z_]*_scan|glob|sniff_csv|parquet_[a-z_]*|duckdb_secrets|duckdb_settings|which_secret|getenv)"|"table_name":"[^"]*[/\\.:]')
+       THEN query END
 );
 SET GLOBAL quack_authorization_function = 'read_only';
 ```
+
+`quack_serve` returns a row that includes the token. Keep that row out of logs
+(in the CLI, `.output /dev/null` before the `CALL`). Measured with DuckDB
+1.5.2 and Quack `core_nightly` 893744a. An older nightly (1693647) answered
+every request with HTTP 500 once any macro was the callback.
 
 For non-local deployments, terminate TLS at a reverse proxy in front of
 Quack and do not expose the Quack listener directly to the public internet.
@@ -134,12 +149,14 @@ duplicates the name and Toolbox refuses to start.
 | `attach_on_startup`   | boolean     | false        | `true`         | Set to `false` to defer `ATTACH` to first tool invocation.                                                     |
 | `additional_attachments` | list     | false        | `[]`           | Optional extra Quack servers to ATTACH into the same in-process DuckDB. Each entry needs `uri` and `attach_alias`; `token` and `disable_ssl` default to the source's primary values when omitted. Enables cross-catalog queries (see Advanced Usage). |
 | `quack.install_from`  | string      | false        | `"core_nightly"`| DuckDB extension repository to install Quack from. Pin to a stable repository for reproducible deployments.   |
-| `quack.use_secret`    | boolean     | false        | `true`         | When true, the token is stored in a per-source `CREATE SECRET (TYPE quack, …)` and the `ATTACH` reads it implicitly. |
+| `quack.use_secret`    | boolean     | false        | `true`         | When true, the token is stored in a per-source `CREATE SECRET (TYPE quack, …, SCOPE '<uri>')` and the `ATTACH` reads it implicitly. The secret is scoped to the source's URI, so the token is never offered to another host (an unscoped quack secret is sent to any host a `quack_query` names). |
 | `policy.read_only`    | boolean     | false        | `false`        | Informational; the Quack server's `quack_authorization_function` is the enforced boundary.                     |
 | `policy.reject_multiple_statements` | boolean | false | `true`     | Reject statements with more than one SQL command at tool config-load time.                                    |
 | `policy.allowed_statement_kinds` | []string | false | (tool default) | Leading SQL keywords accepted by `duckdb-sql` tools that target this source. Defaults to `SELECT, WITH, DESCRIBE, SHOW, EXPLAIN, PIVOT, UNPIVOT, VALUES, TABLE`. |
 | `policy.max_rows`     | integer     | false        | `1000`         | Maximum rows returned to the caller. Excess rows are dropped and `truncated` is set to `true` on the response. |
 | `policy.timeout`      | duration    | false        | `30s`          | Per-invocation context deadline applied at the tool layer.                                                     |
+| `policy.forbidden_patterns` | []string | false     | `[]`           | Extra tokens the statement validator refuses, on top of the built-in deny list (e.g. `read_csv`, `quack_query` for curated tools that must not use them). |
+| `policy.allow_local_files` | boolean | false        | `false`        | Keep the client DuckDB's local filesystem. By default the source runs `SET disabled_filesystems = 'LocalFileSystem'` after Quack is loaded and the remotes are attached, so no statement can read files of the Toolbox's host (`read_csv('/etc/passwd')`, `FROM '/path'`). Remote catalogs and re-ATTACHes keep working. Applies to the default in-memory `client_database` only. |
 
 ### Connection properties
 
